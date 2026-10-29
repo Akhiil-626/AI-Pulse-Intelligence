@@ -7,12 +7,14 @@ AI Pulse is an AI research, developer tools, and cybersecurity intelligence dash
 ## Technology Stack
 
 - **Python**: 3.12+ (tested and verified on Python 3.13)
+- **Ingestion API**: [FastAPI](https://fastapi.tiangolo.com/) with [Pydantic v2](https://docs.pydantic.dev/)
+- **API Server**: [Uvicorn](https://www.uvicorn.org/)
 - **Dashboard Framework**: [Streamlit](https://streamlit.io/) (v1.40+)
 - **Data Manipulation**: [pandas](https://pandas.pydata.org/)
 - **Visualizations**: [Plotly](https://plotly.com/)
-- **Data Persistence**: [SQLite](https://www.sqlite.org/) via Python's standard library `sqlite3`
-- **Testing**: [pytest](https://pytest.org/) (v8.0+) & standard `unittest`
-- **Workflow Automation**: Self-hosted n8n (v2.44.6, scheduled for Phase 3)
+- **Data Persistence**: [SQLite](https://www.sqlite.org/) via standard library `sqlite3`
+- **Testing**: [pytest](https://pytest.org/) & [HTTPX](https://www.python-httpx.org/)
+- **Workflow Automation**: Self-hosted n8n (v2.44.6, scheduled for Phase 3.2)
 - **Local Inference**: Ollama (scheduled for a later phase)
 - **Version Control**: Git
 
@@ -34,11 +36,13 @@ AI-Pulse/
 │   └── raw/                  # Ingested feed payloads (git-ignored)
 ├── services/
 │   ├── __init__.py           # Service layer package marker
-│   └── database.py           # SQLite database connection, schema, and queries
+│   ├── database.py           # SQLite database connection, schema, and queries
+│   └── ingestion_api.py      # Authenticated FastAPI data ingestion service
 ├── tests/
 │   ├── test_phase1.py        # Automated test suite for Phase 1 verification
-│   └── test_database.py      # Automated pytest suite for Phase 2 database
-├── .env.example              # Minimal environment variable template
+│   ├── test_database.py      # Automated pytest suite for Phase 2 database
+│   └── test_ingestion_api.py # Automated pytest suite for Phase 3.1 ingestion API
+├── .env.example              # Environment variable template with INGEST_API_TOKEN
 ├── .gitignore                # Comprehensive exclusions (venv, caches, data, sqlite)
 ├── README.md                 # Project documentation and setup guide
 └── requirements.txt          # Python project dependencies
@@ -46,11 +50,92 @@ AI-Pulse/
 
 ---
 
+## Ingestion API (Phase 3.1)
+
+### Security Notice
+> [!WARNING]
+> The Ingestion API is designed for **local development and private pipeline ingestion only**. It binds to `127.0.0.1` by default and must **never** be exposed directly to the public internet without an upstream reverse proxy (e.g., Caddy, Nginx), TLS termination, and rate limiting.
+
+### 1. Configuration
+Set the ingestion authentication token in your local `.env` file (copied from `.env.example`):
+
+```bash
+# Generate a secure token, e.g. using openssl rand -hex 32
+INGEST_API_TOKEN=your_secure_random_token_here
+```
+
+### 2. Launch the Ingestion API
+Run Uvicorn bound to localhost:
+
+```bash
+uvicorn services.ingestion_api:app --host 127.0.0.1 --port 8000 --reload
+```
+Interactive API documentation will be available at `http://127.0.0.1:8000/docs`.
+
+### 3. Ingestion Endpoint: `POST /api/v1/ingest`
+- **Authentication**: `Authorization: Bearer <INGEST_API_TOKEN>`
+- **Content-Type**: `application/json`
+- **Accepted Sources**: `arXiv`, `Hacker News`, `GitHub Releases`, `NVD CVE`, `CISA KEV`
+- **Accepted Domains**: `AI research`, `dev-tools`, `cybersecurity`
+
+#### Example JSON Payload
+```json
+[
+  {
+    "id": "2401.12345",
+    "source": "arXiv",
+    "domain": "AI research",
+    "title": "Reasoning Breakthroughs in Frontier Models",
+    "url": "https://arxiv.org/abs/2401.12345",
+    "text": "Abstract exploring chain-of-thought and verification loops.",
+    "published_at": "2026-02-01T10:00:00Z",
+    "fetched_at": "2026-02-01T10:15:00Z"
+  },
+  {
+    "id": "CVE-2026-1029",
+    "source": "NVD CVE",
+    "domain": "cybersecurity",
+    "title": "Critical RCE Advisory in Network Parser",
+    "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-1029",
+    "text": "Buffer overflow disclosed in packet parsing library."
+  }
+]
+```
+*(Alternatively, an object with an `"items"` list container `{"items": [...]}` is also accepted.)*
+
+#### Example curl Request
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/ingest \
+  -H "Authorization: Bearer your_secure_random_token_here" \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "id": "2401.12345",
+      "source": "arXiv",
+      "domain": "AI research",
+      "title": "Reasoning Breakthroughs in Frontier Models",
+      "url": "https://arxiv.org/abs/2401.12345"
+    }
+  ]'
+```
+
+#### Example Response
+```json
+{
+  "received": 1,
+  "inserted": 1,
+  "skipped": 0,
+  "message": null
+}
+```
+
+---
+
 ## Database Architecture (Phase 2)
 
 ### Location & Persistence
-- **Default Database Path**: `data/ai_pulse.db` (configurable via `db_path` parameter).
-- Parent directories are automatically resolved and created when absent.
+- **Default Database Path**: `data/ai_pulse.db` (configurable via `AI_PULSE_DB_PATH` or function parameter).
+- Parent directories are automatically created when absent.
 - The database is excluded from Git tracking via `.gitignore`.
 
 ### Schema: `intelligence_items`
@@ -77,60 +162,34 @@ CREATE TABLE IF NOT EXISTS intelligence_items (
 );
 ```
 
-### Conflict Handling & Deduplication Strategy
-Duplicate ingestion is prevented via a `UNIQUE(source, source_id)` constraint paired with `INSERT OR IGNORE`.
-When an intelligence item with a previously ingested `(source, source_id)` pair is submitted, SQLite silently bypasses insertion without raising an error or overwriting existing attributes. `insert_item` returns the primary key ID if newly created, or `None` if ignored as a duplicate.
-
-### Database Initialization
-The database and tables are initialized programmatically via `services/database.py`:
-```python
-from services.database import init_db
-
-# Initializes default database at data/ai_pulse.db
-init_db()
-
-# Or specify a custom path
-init_db("custom/path/ai_pulse.db")
-```
+### Deduplication Strategy
+Duplicate ingestion is prevented via `UNIQUE(source, source_id)` paired with `INSERT OR IGNORE`. Existing records are never overwritten, and repeated items are reported as `skipped`.
 
 ---
 
-## Setup & Installation
+## Setup & Testing
 
-### 1. Prerequisites
-- Python 3.12 or compatible (Python 3.13 supported).
-- Git installed on your system.
-
-### 2. Create and Activate Virtual Environment
-
-**Windows (PowerShell):**
+### 1. Create and Activate Virtual Environment
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-**macOS / Linux:**
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install Dependencies
+### 2. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Run the Dashboard
-```bash
-streamlit run app/dashboard.py
-```
-Open your browser at `http://localhost:8501`.
+### 3. Run Automated Tests
 
-### 5. Run Automated Tests
-
-Run the full pytest suite (including all database tests):
+Run the full pytest suite (Scaffold, Database, and API tests):
 ```bash
 pytest -v
+```
+
+Run only the Ingestion API tests:
+```bash
+pytest tests/test_ingestion_api.py -v
 ```
 
 Run only the database tests:
@@ -138,27 +197,18 @@ Run only the database tests:
 pytest tests/test_database.py -v
 ```
 
-Run Phase 1 scaffold tests:
+### 4. Run the Dashboard
 ```bash
-python -m unittest discover tests
+streamlit run app/dashboard.py
 ```
+Open `http://localhost:8501` in your browser.
 
 ---
 
-## Implementation Status & Roadmap
+## Implementation Roadmap
 
-### Phase 1: Scaffold & Base UI (Complete)
-- Project directory hierarchy, `.gitignore`, and virtual environment setup.
-- Professional dark-themed Streamlit UI with sidebar navigation and intelligence pillars.
-- Empty-state notifications indicating future automated pipeline data.
-
-### Phase 2: SQLite Storage & Data Model (Complete)
-- `services/database.py` implemented with parameterized queries, transactions, and foreign-key pragma.
-- `intelligence_items` data model with `(source, source_id)` uniqueness and validation.
-- Clean CRUD functions: `init_db`, `insert_item`, `insert_items`, `get_items` (pagination), `get_item_by_id`, `count_items`, `update_read_status`, `update_bookmark_status`.
-- 10 automated pytest tests using isolated temporary databases (`tmp_path`).
-
-### Upcoming Phases
-> [!NOTE]
-> - **n8n Integration (v2.44.6)**: Ingestion webhooks and automated collectors are planned for a subsequent phase; the existing n8n workflow was not altered.
-> - **AI Processing & Summarization**: Local inference with Ollama and relevance scoring will be integrated after the data collection pipeline is established.
+- **Phase 1 (Complete)**: UI scaffold, virtual environment, and dark-themed Streamlit dashboard.
+- **Phase 2 (Complete)**: SQLite storage, schema, and database functions.
+- **Phase 3.1 (Complete)**: Authenticated local Ingestion API (`POST /api/v1/ingest`).
+- **Phase 3.2 (Upcoming)**: n8n workflow integration (webhook forwarding to API).
+- **Phase 4 (Upcoming)**: Ollama local processing, AI summarization, and relevance scoring.
