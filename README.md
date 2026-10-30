@@ -50,11 +50,11 @@ AI-Pulse/
 
 ---
 
-## Ingestion API (Phase 3.1)
+## Ingestion API (Phase 3.1 & 3.2)
 
 ### Security Notice
 > [!WARNING]
-> The Ingestion API is designed for **local development and private pipeline ingestion only**. It binds to `127.0.0.1` by default and must **never** be exposed directly to the public internet without an upstream reverse proxy (e.g., Caddy, Nginx), TLS termination, and rate limiting.
+> The Ingestion API is designed for **local development and private pipeline ingestion only**. It binds to `0.0.0.0` (or `127.0.0.1`) for local container connectivity and must **never** be exposed directly to the public internet without an upstream reverse proxy (e.g., Caddy, Nginx), TLS termination, and rate limiting.
 
 ### 1. Configuration
 Set the ingestion authentication token in your local `.env` file (copied from `.env.example`):
@@ -62,17 +62,29 @@ Set the ingestion authentication token in your local `.env` file (copied from `.
 ```bash
 # Generate a secure token, e.g. using openssl rand -hex 32
 INGEST_API_TOKEN=your_secure_random_token_here
+INGEST_API_PORT=8001
 ```
 
 ### 2. Launch the Ingestion API
-Run Uvicorn bound to localhost:
+Run Uvicorn bound to `0.0.0.0` on port `8001` (port `8001` avoids collisions with other local containers):
 
 ```bash
-uvicorn services.ingestion_api:app --host 127.0.0.1 --port 8000 --reload
+uvicorn services.ingestion_api:app --host 0.0.0.0 --port 8001 --reload
 ```
-Interactive API documentation will be available at `http://127.0.0.1:8000/docs`.
+Interactive API documentation will be available at `http://127.0.0.1:8001/docs`.
 
-### 3. Ingestion Endpoint: `POST /api/v1/ingest`
+### 3. Docker & n8n Connectivity (Phase 3.2)
+When sending ingestion requests from containers running inside Docker (such as **n8n**):
+- **Docker-to-Windows Ingestion URL**:
+  ```text
+  http://host.docker.internal:8001/api/v1/ingest
+  ```
+- **Localhost Ingestion URL** (host machine):
+  ```text
+  http://127.0.0.1:8001/api/v1/ingest
+  ```
+
+### 4. Ingestion Endpoint: `POST /api/v1/ingest`
 - **Authentication**: `Authorization: Bearer <INGEST_API_TOKEN>`
 - **Content-Type**: `application/json`
 - **Accepted Sources**: `arXiv`, `Hacker News`, `GitHub Releases`, `NVD CVE`, `CISA KEV`
@@ -105,7 +117,7 @@ Interactive API documentation will be available at `http://127.0.0.1:8000/docs`.
 
 #### Example curl Request
 ```bash
-curl -X POST http://127.0.0.1:8000/api/v1/ingest \
+curl -X POST http://127.0.0.1:8001/api/v1/ingest \
   -H "Authorization: Bearer your_secure_random_token_here" \
   -H "Content-Type: application/json" \
   -d '[
