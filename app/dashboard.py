@@ -1,9 +1,15 @@
 """AI Pulse - Intelligence Dashboard.
 
-Phase 1: Project scaffold, Python environment, and base Streamlit UI.
+Phase 4.1.1: Database Integration and Live Overview Metrics.
 """
 
+import os
+from pathlib import Path
+from typing import Any
+
 import streamlit as st
+
+from services.database import DEFAULT_DB_PATH, count_items, init_db
 
 # Configure page settings
 st.set_page_config(
@@ -128,7 +134,45 @@ st.markdown(
 )
 
 
-def render_sidebar() -> str:
+def get_dashboard_db_path() -> Path:
+    """Resolves the database path for the dashboard, respecting environment overrides."""
+    env_path = os.environ.get("AI_PULSE_DB_PATH")
+    if env_path:
+        return Path(env_path)
+    return DEFAULT_DB_PATH
+
+
+def fetch_overview_metrics(db_path: Path | str | None = None) -> dict[str, Any]:
+    """Fetches real-time counts from the SQLite database using services.database.
+    
+    Returns total items, unread items, bookmarked items, and cybersecurity threats.
+    Catches database exceptions gracefully to prevent dashboard crashes.
+    """
+    target_path = db_path if db_path is not None else get_dashboard_db_path()
+    try:
+        init_db(target_path)
+        total_items = count_items(db_path=target_path)
+        unread_items = count_items(is_read=0, db_path=target_path)
+        bookmarked_items = count_items(is_bookmarked=1, db_path=target_path)
+        threat_alerts = count_items(domain="cybersecurity", db_path=target_path)
+        return {
+            "total": total_items,
+            "unread": unread_items,
+            "bookmarked": bookmarked_items,
+            "threats": threat_alerts,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "total": 0,
+            "unread": 0,
+            "bookmarked": 0,
+            "threats": 0,
+            "error": str(exc),
+        }
+
+
+def render_sidebar(db_error: str | None = None) -> str:
     """Renders the dashboard sidebar navigation and system information."""
     with st.sidebar:
         st.markdown("## ⚡ AI Pulse")
@@ -154,35 +198,51 @@ def render_sidebar() -> str:
 
         st.markdown("---")
 
+        db_status = "SQLite (Connected)" if db_error is None else "SQLite (Unavailable)"
+
         # System and environment indicators
         st.markdown(
-            """
+            f"""
             <div class="sidebar-meta">
-                <div><strong>Current Phase:</strong> Phase 1 (Scaffold & UI)</div>
+                <div><strong>Current Phase:</strong> Phase 4.1.1 (Live Overview)</div>
                 <div style="margin-top: 6px;"><strong>Data Pipeline:</strong> Standby (n8n)</div>
-                <div style="margin-top: 6px;"><strong>Database:</strong> SQLite (Pending)</div>
+                <div style="margin-top: 6px;"><strong>Database:</strong> {db_status}</div>
                 <div style="margin-top: 6px;"><strong>Processing:</strong> Ollama (Pending)</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        st.caption("AI Pulse v0.1.0 • Phase 1")
+        st.caption("AI Pulse v0.1.0 • Phase 4.1.1")
 
     return selected_page
 
 
-def render_metrics_row() -> None:
-    """Renders status cards clearly indicating data integration is pending."""
+def render_metrics_row(metrics: dict[str, Any] | None = None) -> None:
+    """Renders status cards displaying live metrics from the SQLite database."""
+    if metrics is None:
+        metrics = fetch_overview_metrics()
+
+    if metrics.get("error"):
+        st.error(
+            f"⚠️ Database connection unavailable: {metrics['error']}. Displaying fallback metrics.",
+            icon="🚨",
+        )
+
     col1, col2, col3, col4 = st.columns(4)
+
+    total_val = metrics.get("total", 0)
+    unread_val = metrics.get("unread", 0)
+    bookmarked_val = metrics.get("bookmarked", 0)
+    threats_val = metrics.get("threats", 0)
 
     with col1:
         st.markdown(
-            """
+            f"""
             <div class="metric-card">
-                <div class="metric-label">Feed Sources</div>
-                <div class="metric-value">--</div>
-                <div class="metric-note">Integration pending (n8n)</div>
+                <div class="metric-label">Total Intelligence Items</div>
+                <div class="metric-value">{total_val}</div>
+                <div class="metric-note">{"Awaiting ingestion" if total_val == 0 else "All stored records"}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -190,11 +250,11 @@ def render_metrics_row() -> None:
 
     with col2:
         st.markdown(
-            """
+            f"""
             <div class="metric-card">
-                <div class="metric-label">Intelligence Items</div>
-                <div class="metric-value">--</div>
-                <div class="metric-note">Awaiting pipeline ingestion</div>
+                <div class="metric-label">Unread Items</div>
+                <div class="metric-value">{unread_val}</div>
+                <div class="metric-note">is_read = 0 (Awaiting review)</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -202,11 +262,11 @@ def render_metrics_row() -> None:
 
     with col3:
         st.markdown(
-            """
+            f"""
             <div class="metric-card">
-                <div class="metric-label">Threat Alerts</div>
-                <div class="metric-value">--</div>
-                <div class="metric-note">Advisories disconnected</div>
+                <div class="metric-label">Bookmarked Items</div>
+                <div class="metric-value">{bookmarked_val}</div>
+                <div class="metric-note">is_bookmarked = 1 (Saved items)</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -214,11 +274,11 @@ def render_metrics_row() -> None:
 
     with col4:
         st.markdown(
-            """
+            f"""
             <div class="metric-card">
-                <div class="metric-label">Automation Pipeline</div>
-                <div class="metric-value">Standby</div>
-                <div class="metric-note">Self-hosted n8n 2.44.6</div>
+                <div class="metric-label">Threat Alerts</div>
+                <div class="metric-value">{threats_val}</div>
+                <div class="metric-note">domain = 'cybersecurity'</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -233,24 +293,34 @@ def render_overview() -> None:
         unsafe_allow_html=True,
     )
 
-    # Status indicators row
-    render_metrics_row()
+    # Fetch live database metrics
+    metrics = fetch_overview_metrics()
+
+    # Status indicators row with live metrics
+    render_metrics_row(metrics)
 
     # Empty-state message explaining that intelligence items will appear after n8n integration
-    st.markdown(
-        """
-        <div class="empty-state-box">
-            <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">📡</div>
-            <div class="empty-state-title">Intelligence Feeds Awaiting Data Ingestion</div>
-            <div class="empty-state-text">
-                No intelligence items are loaded yet. Ingested feeds, research papers, tool release logs, 
-                and threat advisories will populate automatically once the <strong>n8n automation pipeline</strong> 
-                and database persistence are integrated in the upcoming phases.
+    if metrics.get("total", 0) == 0:
+        st.markdown(
+            """
+            <div class="empty-state-box">
+                <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">📡</div>
+                <div class="empty-state-title">Intelligence Feeds Awaiting Data Ingestion</div>
+                <div class="empty-state-text">
+                    No intelligence items are loaded yet. Ingested feeds, research papers, tool release logs, 
+                    and threat advisories will populate automatically once the <strong>n8n automation pipeline</strong> 
+                    and database persistence are integrated in the upcoming phases.
+                </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.success(
+            f"⚡ **{metrics['total']} intelligence records loaded in SQLite database.** "
+            f"({metrics['unread']} unread, {metrics['bookmarked']} bookmarked, {metrics['threats']} threat alerts)",
+            icon="✅",
+        )
 
     # Core pillars / intelligence focus areas
     st.markdown("### Intelligence Pillars")
@@ -317,7 +387,8 @@ def render_placeholder(page_name: str) -> None:
 
 def main() -> None:
     """Application entry point."""
-    selected_page = render_sidebar()
+    metrics = fetch_overview_metrics()
+    selected_page = render_sidebar(db_error=metrics.get("error"))
 
     if selected_page == "Overview":
         render_overview()
