@@ -227,8 +227,22 @@ def test_item_count_with_and_without_filters(test_db_path: Path):
     assert count_items(domain="AI research", db_path=test_db_path) == 2
     assert count_items(domain="cybersecurity", db_path=test_db_path) == 1
     assert count_items(domain="dev-tools", db_path=test_db_path) == 0
+    assert count_items(source="s1", db_path=test_db_path) == 2
+    assert count_items(source="s2", db_path=test_db_path) == 1
+    assert count_items(source="nonexistent", db_path=test_db_path) == 0
     assert count_items(is_read=1, db_path=test_db_path) == 2
     assert count_items(is_bookmarked=1, db_path=test_db_path) == 2
+
+    # Verify get_items with source filter
+    s1_items = get_items(source="s1", db_path=test_db_path)
+    assert len(s1_items) == 2
+    assert all(it["source"] == "s1" for it in s1_items)
+
+    # Verify multiple source filtering with list/tuple
+    assert count_items(source=["s1", "s2"], db_path=test_db_path) == 3
+    multi_items = get_items(source=("s1", "s2"), db_path=test_db_path)
+    assert len(multi_items) == 3
+    assert set(it["source"] for it in multi_items) == {"s1", "s2"}
 
 
 def test_updating_read_and_bookmark_status(test_db_path: Path):

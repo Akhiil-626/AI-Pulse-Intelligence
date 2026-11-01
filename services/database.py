@@ -208,6 +208,7 @@ def get_items(
     domain: str | None = None,
     is_read: int | None = None,
     is_bookmarked: int | None = None,
+    source: str | list[str] | tuple[str, ...] | None = None,
     db_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieves intelligence items with pagination and optional filtering."""
@@ -222,6 +223,15 @@ def get_items(
     if domain is not None:
         conditions.append("domain = :domain")
         params["domain"] = domain
+    if source is not None:
+        if isinstance(source, (list, tuple, set)):
+            placeholders = ", ".join(f":source_{i}" for i in range(len(source)))
+            conditions.append(f"source IN ({placeholders})")
+            for i, s in enumerate(source):
+                params[f"source_{i}"] = s
+        else:
+            conditions.append("source = :source")
+            params["source"] = source
     if is_read is not None:
         conditions.append("is_read = :is_read")
         params["is_read"] = 1 if is_read else 0
@@ -256,6 +266,7 @@ def count_items(
     domain: str | None = None,
     is_read: int | None = None,
     is_bookmarked: int | None = None,
+    source: str | list[str] | tuple[str, ...] | None = None,
     db_path: Path | str | None = None,
 ) -> int:
     """Returns total count of stored items matching optional filters."""
@@ -265,6 +276,15 @@ def count_items(
     if domain is not None:
         conditions.append("domain = :domain")
         params["domain"] = domain
+    if source is not None:
+        if isinstance(source, (list, tuple, set)):
+            placeholders = ", ".join(f":source_{i}" for i in range(len(source)))
+            conditions.append(f"source IN ({placeholders})")
+            for i, s in enumerate(source):
+                params[f"source_{i}"] = s
+        else:
+            conditions.append("source = :source")
+            params["source"] = source
     if is_read is not None:
         conditions.append("is_read = :is_read")
         params["is_read"] = 1 if is_read else 0

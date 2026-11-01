@@ -3,13 +3,32 @@
 Phase 4.1.1: Database Integration and Live Overview Metrics.
 """
 
+import html
+import importlib
 import os
 from pathlib import Path
+import re
+import sys
 from typing import Any
+
+# Ensure project root is on sys.path so services can be imported regardless of execution context
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
 
-from services.database import DEFAULT_DB_PATH, count_items, init_db
+import services.database
+importlib.reload(services.database)
+
+from services.database import (
+    DEFAULT_DB_PATH,
+    count_items,
+    get_items,
+    init_db,
+    update_bookmark_status,
+    update_read_status,
+)
 
 # Configure page settings
 st.set_page_config(
@@ -285,8 +304,9 @@ def render_metrics_row(metrics: dict[str, Any] | None = None) -> None:
         )
 
 
-def render_overview() -> None:
+def render_overview(db_path: Path | str | None = None) -> None:
     """Renders the main overview section with introduction and empty-state messaging."""
+    target_path = db_path if db_path is not None else get_dashboard_db_path()
     st.markdown('<div class="pulse-title">AI Pulse</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="pulse-subtitle">AI Research, Developer Tools & Cybersecurity Intelligence</div>',
@@ -294,7 +314,7 @@ def render_overview() -> None:
     )
 
     # Fetch live database metrics
-    metrics = fetch_overview_metrics()
+    metrics = fetch_overview_metrics(db_path=target_path)
 
     # Status indicators row with live metrics
     render_metrics_row(metrics)
@@ -369,6 +389,357 @@ def render_overview() -> None:
         )
 
 
+SUPPORTED_SOURCES = ("arXiv", "Hacker News")
+
+
+def format_item_text(raw_text: str | None) -> str:
+    """Decodes HTML entities and strips or converts HTML markup into clean readable text.
+
+    Does not modify database records.
+    """
+    if not raw_text:
+        return "No content available."
+    # Decode HTML entities (e.g. &#x2F;, &amp;, &lt;, &gt;, &quot;, &#39;)
+    text = html.unescape(raw_text)
+    # Convert paragraph tags and line break tags into newlines
+    text = re.sub(r"(?i)<\s*p\s*/?>", "\n\n", text)
+    text = re.sub(r"(?i)<\s*br\s*/?>", "\n", text)
+    # Strip any remaining HTML tags (like <a href="...">, </a>, <span>, etc.)
+    text = re.sub(r"<[^>]+>", "", text)
+    # Normalize excess whitespace/newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() or "No content available."
+
+
+def fetch_feed_data(
+    selected_source: str = "All Sources",
+    db_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Fetches intelligence items and summary counts directly from the SQLite database.
+
+    Supports filtering by 'All Sources', 'arXiv', or 'Hacker News'.
+    """
+    target_path = db_path if db_path is not None else get_dashboard_db_path()
+    try:
+        init_db(target_path)
+        total_arxiv = count_items(source="arXiv", db_path=target_path)
+        total_hn = count_items(source="Hacker News", db_path=target_path)
+        total_items = total_arxiv + total_hn
+
+        unread_arxiv = count_items(source="arXiv", is_read=0, db_path=target_path)
+        unread_hn = count_items(source="Hacker News", is_read=0, db_path=target_path)
+        unread_items = unread_arxiv + unread_hn
+
+        bookmarked_arxiv = count_items(source="arXiv", is_bookmarked=1, db_path=target_path)
+        bookmarked_hn = count_items(source="Hacker News", is_bookmarked=1, db_path=target_path)
+        bookmarked_items = bookmarked_arxiv + bookmarked_hn
+
+        if selected_source == "arXiv":
+            items = get_items(source="arXiv", limit=100, db_path=target_path)
+        elif selected_source == "Hacker News":
+            items = get_items(source="Hacker News", limit=100, db_path=target_path)
+        else:
+            raw_items = get_items(limit=100, db_path=target_path)
+            items = [it for it in raw_items if it.get("source") in SUPPORTED_SOURCES]
+
+        return {
+            "items": items,
+            "total_items": total_items,
+            "total_arxiv": total_arxiv,
+            "total_hn": total_hn,
+            "unread": unread_items,
+            "bookmarked": bookmarked_items,
+            # Backward compatibility fields
+            "total": total_arxiv,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "items": [],
+            "total_items": 0,
+            "total_arxiv": 0,
+            "total_hn": 0,
+            "unread": 0,
+            "bookmarked": 0,
+            "total": 0,
+            "error": str(exc),
+        }
+
+
+def fetch_arxiv_feed_data(db_path: Path | str | None = None) -> dict[str, Any]:
+    """Fetches arXiv items and summary counts directly from the SQLite database.
+
+    Maintained for backward compatibility.
+    """
+    target_path = db_path if db_path is not None else get_dashboard_db_path()
+    try:
+        init_db(target_path)
+        items = get_items(source="arXiv", limit=100, db_path=target_path)
+        total_arxiv = count_items(source="arXiv", db_path=target_path)
+        unread_arxiv = count_items(source="arXiv", is_read=0, db_path=target_path)
+        bookmarked_arxiv = count_items(source="arXiv", is_bookmarked=1, db_path=target_path)
+        return {
+            "items": items,
+            "total": total_arxiv,
+            "unread": unread_arxiv,
+            "bookmarked": bookmarked_arxiv,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "items": [],
+            "total": 0,
+            "unread": 0,
+            "bookmarked": 0,
+            "error": str(exc),
+        }
+
+
+def handle_bookmark_toggle(item_id: int, key: str, db_path: Path | str | None = None) -> None:
+    """Updates bookmark status in the SQLite database when toggle is changed."""
+    new_status = st.session_state.get(key, False)
+    update_bookmark_status(item_id, 1 if new_status else 0, db_path=db_path)
+
+
+def handle_read_toggle(item_id: int, key: str, db_path: Path | str | None = None) -> None:
+    """Updates read status in the SQLite database when toggle is changed."""
+    new_status = st.session_state.get(key, False)
+    update_read_status(item_id, 1 if new_status else 0, db_path=db_path)
+
+
+def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
+    """Renders status cards displaying live multi-source intelligence feed metrics."""
+    total_val = feed_data.get("total_items", 0)
+    arxiv_val = feed_data.get("total_arxiv", 0)
+    hn_val = feed_data.get("total_hn", 0)
+    unread_val = feed_data.get("unread", 0)
+    bookmarked_val = feed_data.get("bookmarked", 0)
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Total Items</div>
+                <div class="metric-value">{total_val}</div>
+                <div class="metric-note">Total intelligence items</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col2:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">arXiv Papers Stored</div>
+                <div class="metric-value">{arxiv_val}</div>
+                <div class="metric-note">Total arXiv papers</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col3:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Hacker News Stories</div>
+                <div class="metric-value">{hn_val}</div>
+                <div class="metric-note">Total Hacker News stories</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col4:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Unread Items</div>
+                <div class="metric-value">{unread_val}</div>
+                <div class="metric-note">is_read = 0 (Awaiting review)</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col5:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Bookmarked Items</div>
+                <div class="metric-value">{bookmarked_val}</div>
+                <div class="metric-note">is_bookmarked = 1 (Saved items)</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_arxiv_metrics_row(feed_data: dict[str, Any]) -> None:
+    """Backward compatible alias for render_feed_metrics_row."""
+    render_feed_metrics_row(feed_data)
+
+
+def render_intelligence_feed(db_path: Path | str | None = None) -> None:
+    """Renders the functional multi-source Intelligence Feed (arXiv & Hacker News)."""
+    target_path = db_path if db_path is not None else get_dashboard_db_path()
+
+    st.markdown('<div class="pulse-title">Intelligence Feed</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="pulse-subtitle">Curated AI Research (arXiv) & Developer Discussions (Hacker News)</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 1. Source filter control (All Sources, arXiv, Hacker News)
+    # Default is "All Sources"
+    filter_col1, _ = st.columns([2, 3])
+    with filter_col1:
+        selected_source = st.radio(
+            "Filter by Source",
+            options=["All Sources", "arXiv", "Hacker News"],
+            index=0,
+            horizontal=True,
+            key="intelligence_feed_source_filter",
+        )
+
+    feed_data = fetch_feed_data(selected_source=selected_source, db_path=target_path)
+
+    if feed_data.get("error"):
+        st.error(
+            f"⚠️ Database connection unavailable: {feed_data['error']}. Unable to load intelligence feed.",
+            icon="🚨",
+        )
+        return
+
+    # 2. Metrics row showing total, arXiv, Hacker News, unread, and bookmarked
+    render_feed_metrics_row(feed_data)
+
+    items = feed_data.get("items", [])
+
+    if not items:
+        # Useful empty state if no records exist for the selected filter
+        if selected_source == "arXiv":
+            empty_title = "No arXiv Research Papers Found"
+            empty_desc = (
+                "No research papers from arXiv are currently stored in the database. "
+                "Trigger the <strong>n8n arXiv pipeline</strong> to fetch and ingest papers."
+            )
+        elif selected_source == "Hacker News":
+            empty_title = "No Hacker News Stories Found"
+            empty_desc = (
+                "No stories from Hacker News are currently stored in the database. "
+                "Trigger the <strong>n8n Hacker News pipeline</strong> to fetch and ingest stories."
+            )
+        else:
+            empty_title = "No Intelligence Items Found"
+            empty_desc = (
+                "No intelligence items are currently stored in the database "
+                "(No arXiv Research Papers Found or Hacker News stories). "
+                "Trigger the <strong>n8n automation pipeline</strong> to fetch and ingest records."
+            )
+
+        st.markdown(
+            f"""
+            <div class="empty-state-box">
+                <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">📄</div>
+                <div class="empty-state-title">{empty_title}</div>
+                <div class="empty-state-text">{empty_desc}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # 3. Render feed cards (arXiv papers & Hacker News stories)
+    for item in items:
+        with st.container(border=True):
+            item_id = item["id"]
+            source_label = item.get("source") or "Unknown"
+            domain_label = item.get("domain") or "General"
+            pub_date = item.get("published_at") or "Unknown"
+            title = item.get("title", "Untitled")
+            clean_title = title.replace("[", "\\[").replace("]", "\\]")
+            url = item.get("url")
+
+            # Title: clickable link if URL exists and is non-empty; ordinary text if null or empty
+            if url and str(url).strip():
+                st.markdown(f"#### [{clean_title}]({str(url).strip()})")
+            else:
+                st.markdown(f"#### {clean_title}")
+
+            # Badges: Source label, Domain label, Publication date
+            is_hn = (source_label == "Hacker News")
+            source_bg = "#9A3412" if is_hn else "#1E3A8A"
+            source_fg = "#FDBA74" if is_hn else "#93C5FD"
+
+            domain_bg = "#4338CA" if domain_label == "dev-tools" else "#064E3B"
+            domain_fg = "#C7D2FE" if domain_label == "dev-tools" else "#6EE7B7"
+
+            st.markdown(
+                f"""
+                <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.15rem; margin-bottom: 0.65rem; flex-wrap: wrap;">
+                    <span style="background: {source_bg}; color: {source_fg}; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                        Source: {source_label}
+                    </span>
+                    <span style="background: {domain_bg}; color: {domain_fg}; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                        Domain: {domain_label}
+                    </span>
+                    <span style="color: #94A3B8; font-size: 0.82rem;">
+                        📅 Publication Date: {pub_date}
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Expandable section: Abstract (for arXiv) or Story Text (for HN)
+            expander_title = "Abstract" if source_label == "arXiv" else "Story Text"
+            cleaned_text = format_item_text(item.get("text") or item.get("summary"))
+            with st.expander(expander_title, expanded=False):
+                st.markdown(cleaned_text)
+
+            # Action toggles: Bookmark and Read/Unread
+            source_slug = "arxiv" if source_label == "arXiv" else "hn"
+            bm_key = f"{source_slug}_bm_{item_id}"
+            read_key = f"{source_slug}_read_{item_id}"
+
+            is_bm = bool(item.get("is_bookmarked", 0))
+            is_rd = bool(item.get("is_read", 0))
+
+            tcol1, tcol2, tcol3 = st.columns([1, 1, 2])
+            with tcol1:
+                st.toggle(
+                    "Bookmark",
+                    value=is_bm,
+                    key=bm_key,
+                    on_change=handle_bookmark_toggle,
+                    args=(item_id, bm_key, target_path),
+                )
+            with tcol2:
+                st.toggle(
+                    "Read",
+                    value=is_rd,
+                    key=read_key,
+                    on_change=handle_read_toggle,
+                    args=(item_id, read_key, target_path),
+                )
+            with tcol3:
+                status_parts = []
+                if is_bm:
+                    status_parts.append("⭐ Bookmarked")
+                if is_rd:
+                    status_parts.append("✓ Read")
+                else:
+                    status_parts.append("○ Unread")
+                st.markdown(
+                    f'<div style="color: #94A3B8; font-size: 0.82rem; margin-top: 0.35rem;">{" • ".join(status_parts)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
 def render_placeholder(page_name: str) -> None:
     """Renders clean visual placeholder view for secondary navigation options."""
     st.markdown(f'<div class="pulse-title">{page_name}</div>', unsafe_allow_html=True)
@@ -387,11 +758,14 @@ def render_placeholder(page_name: str) -> None:
 
 def main() -> None:
     """Application entry point."""
-    metrics = fetch_overview_metrics()
+    target_path = get_dashboard_db_path()
+    metrics = fetch_overview_metrics(db_path=target_path)
     selected_page = render_sidebar(db_error=metrics.get("error"))
 
     if selected_page == "Overview":
-        render_overview()
+        render_overview(db_path=target_path)
+    elif selected_page == "Intelligence Feed":
+        render_intelligence_feed(db_path=target_path)
     else:
         render_placeholder(selected_page)
 
