@@ -202,6 +202,114 @@ def insert_items(items: list[dict[str, Any]], db_path: Path | str | None = None)
     return inserted_count
 
 
+def upsert_item(item: dict[str, Any], db_path: Path | str | None = None) -> tuple[int, str]:
+    """Inserts a single intelligence item, or updates content fields if it already exists.
+
+    When (source, source_id) already exists, updates content fields:
+    (domain, title, url, text, published_at, fetched_at) while preserving user-managed
+    fields (is_read, is_bookmarked).
+
+    Returns:
+        tuple (item_id, action) where action is 'inserted' or 'updated'.
+    """
+    validated = validate_item_payload(item)
+    select_sql = "SELECT id FROM intelligence_items WHERE source = :source AND source_id = :source_id;"
+    insert_sql = """
+    INSERT INTO intelligence_items (
+        source, source_id, domain, title, url, text,
+        published_at, fetched_at, summary, relevance_score,
+        relevance_reason, is_read, is_bookmarked
+    ) VALUES (
+        :source, :source_id, :domain, :title, :url, :text,
+        :published_at, :fetched_at, :summary, :relevance_score,
+        :relevance_reason, :is_read, :is_bookmarked
+    );
+    """
+    update_sql = """
+    UPDATE intelligence_items SET
+        domain = :domain,
+        title = :title,
+        url = :url,
+        text = :text,
+        published_at = :published_at,
+        fetched_at = :fetched_at
+    WHERE id = :id;
+    """
+    with get_db_connection(db_path) as conn:
+        with conn:
+            cursor = conn.execute(
+                select_sql,
+                {"source": validated["source"], "source_id": validated["source_id"]},
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cur = conn.execute(insert_sql, validated)
+                return cur.lastrowid, "inserted"
+            else:
+                item_id = row["id"]
+                conn.execute(update_sql, {**validated, "id": item_id})
+                return item_id, "updated"
+
+
+def upsert_items(items: list[dict[str, Any]], db_path: Path | str | None = None) -> dict[str, int]:
+    """Safely inserts new items or updates existing items within a single database transaction.
+
+    When (source, source_id) already exists, updates content fields:
+    (domain, title, url, text, published_at, fetched_at) while preserving user-managed
+    fields (is_read, is_bookmarked).
+
+    Returns:
+        dict with counts: {'inserted': count, 'updated': count}
+    """
+    if not items:
+        return {"inserted": 0, "updated": 0}
+
+    validated_items = [validate_item_payload(it) for it in items]
+    inserted_count = 0
+    updated_count = 0
+
+    select_sql = "SELECT id FROM intelligence_items WHERE source = :source AND source_id = :source_id;"
+    insert_sql = """
+    INSERT INTO intelligence_items (
+        source, source_id, domain, title, url, text,
+        published_at, fetched_at, summary, relevance_score,
+        relevance_reason, is_read, is_bookmarked
+    ) VALUES (
+        :source, :source_id, :domain, :title, :url, :text,
+        :published_at, :fetched_at, :summary, :relevance_score,
+        :relevance_reason, :is_read, :is_bookmarked
+    );
+    """
+    update_sql = """
+    UPDATE intelligence_items SET
+        domain = :domain,
+        title = :title,
+        url = :url,
+        text = :text,
+        published_at = :published_at,
+        fetched_at = :fetched_at
+    WHERE id = :id;
+    """
+
+    with get_db_connection(db_path) as conn:
+        with conn:
+            for item in validated_items:
+                cursor = conn.execute(
+                    select_sql,
+                    {"source": item["source"], "source_id": item["source_id"]},
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    conn.execute(insert_sql, item)
+                    inserted_count += 1
+                else:
+                    item_id = row["id"]
+                    conn.execute(update_sql, {**item, "id": item_id})
+                    updated_count += 1
+
+    return {"inserted": inserted_count, "updated": updated_count}
+
+
 def get_items(
     limit: int = 50,
     offset: int = 0,

@@ -16,7 +16,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
-from services.database import DEFAULT_DB_PATH, init_db, insert_items
+from services.database import DEFAULT_DB_PATH, init_db, insert_items, upsert_items
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -75,7 +75,8 @@ class IngestResponse(BaseModel):
 
     received: int = Field(..., description="Total items received in the batch")
     inserted: int = Field(..., description="Count of newly persisted items")
-    skipped: int = Field(..., description="Count of duplicate items skipped")
+    updated: int = Field(default=0, description="Count of existing items updated with new metadata")
+    skipped: int = Field(default=0, description="Count of duplicate items skipped")
     message: str | None = Field(default=None, description="Optional status message")
 
 
@@ -175,6 +176,7 @@ def ingest_records(
         return IngestResponse(
             received=0,
             inserted=0,
+            updated=0,
             skipped=0,
             message="Empty batch received; no records to ingest.",
         )
@@ -207,13 +209,16 @@ def ingest_records(
             }
         )
 
-    # Persist via database layer using duplicate-ignoring transaction
+    # Persist via database layer using duplicate-updating transaction
     received_count = len(db_items)
-    inserted_count = insert_items(db_items, db_path=db_path)
-    skipped_count = received_count - inserted_count
+    counts = upsert_items(db_items, db_path=db_path)
+    inserted_count = counts["inserted"]
+    updated_count = counts["updated"]
+    skipped_count = received_count - (inserted_count + updated_count)
 
     return IngestResponse(
         received=received_count,
         inserted=inserted_count,
+        updated=updated_count,
         skipped=skipped_count,
     )

@@ -389,7 +389,7 @@ def render_overview(db_path: Path | str | None = None) -> None:
         )
 
 
-SUPPORTED_SOURCES = ("arXiv", "Hacker News")
+SUPPORTED_SOURCES = ("arXiv", "Hacker News", "GitHub Releases")
 
 
 def format_item_text(raw_text: str | None) -> str:
@@ -417,27 +417,32 @@ def fetch_feed_data(
 ) -> dict[str, Any]:
     """Fetches intelligence items and summary counts directly from the SQLite database.
 
-    Supports filtering by 'All Sources', 'arXiv', or 'Hacker News'.
+    Supports filtering by 'All Sources', 'arXiv', 'Hacker News', or 'GitHub Releases'.
     """
     target_path = db_path if db_path is not None else get_dashboard_db_path()
     try:
         init_db(target_path)
         total_arxiv = count_items(source="arXiv", db_path=target_path)
         total_hn = count_items(source="Hacker News", db_path=target_path)
-        total_items = total_arxiv + total_hn
+        total_gh = count_items(source="GitHub Releases", db_path=target_path)
+        total_items = total_arxiv + total_hn + total_gh
 
         unread_arxiv = count_items(source="arXiv", is_read=0, db_path=target_path)
         unread_hn = count_items(source="Hacker News", is_read=0, db_path=target_path)
-        unread_items = unread_arxiv + unread_hn
+        unread_gh = count_items(source="GitHub Releases", is_read=0, db_path=target_path)
+        unread_items = unread_arxiv + unread_hn + unread_gh
 
         bookmarked_arxiv = count_items(source="arXiv", is_bookmarked=1, db_path=target_path)
         bookmarked_hn = count_items(source="Hacker News", is_bookmarked=1, db_path=target_path)
-        bookmarked_items = bookmarked_arxiv + bookmarked_hn
+        bookmarked_gh = count_items(source="GitHub Releases", is_bookmarked=1, db_path=target_path)
+        bookmarked_items = bookmarked_arxiv + bookmarked_hn + bookmarked_gh
 
         if selected_source == "arXiv":
             items = get_items(source="arXiv", limit=100, db_path=target_path)
         elif selected_source == "Hacker News":
             items = get_items(source="Hacker News", limit=100, db_path=target_path)
+        elif selected_source == "GitHub Releases":
+            items = get_items(source="GitHub Releases", limit=100, db_path=target_path)
         else:
             raw_items = get_items(limit=100, db_path=target_path)
             items = [it for it in raw_items if it.get("source") in SUPPORTED_SOURCES]
@@ -447,6 +452,8 @@ def fetch_feed_data(
             "total_items": total_items,
             "total_arxiv": total_arxiv,
             "total_hn": total_hn,
+            "total_gh": total_gh,
+            "total_github": total_gh,
             "unread": unread_items,
             "bookmarked": bookmarked_items,
             # Backward compatibility fields
@@ -459,6 +466,8 @@ def fetch_feed_data(
             "total_items": 0,
             "total_arxiv": 0,
             "total_hn": 0,
+            "total_gh": 0,
+            "total_github": 0,
             "unread": 0,
             "bookmarked": 0,
             "total": 0,
@@ -512,10 +521,11 @@ def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
     total_val = feed_data.get("total_items", 0)
     arxiv_val = feed_data.get("total_arxiv", 0)
     hn_val = feed_data.get("total_hn", 0)
+    gh_val = feed_data.get("total_gh", feed_data.get("total_github", 0))
     unread_val = feed_data.get("unread", 0)
     bookmarked_val = feed_data.get("bookmarked", 0)
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
         st.markdown(
@@ -557,6 +567,18 @@ def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
         st.markdown(
             f"""
             <div class="metric-card">
+                <div class="metric-label">GitHub Releases</div>
+                <div class="metric-value">{gh_val}</div>
+                <div class="metric-note">Total GitHub releases</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col5:
+        st.markdown(
+            f"""
+            <div class="metric-card">
                 <div class="metric-label">Unread Items</div>
                 <div class="metric-value">{unread_val}</div>
                 <div class="metric-note">is_read = 0 (Awaiting review)</div>
@@ -565,7 +587,7 @@ def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
 
-    with col5:
+    with col6:
         st.markdown(
             f"""
             <div class="metric-card">
@@ -584,22 +606,22 @@ def render_arxiv_metrics_row(feed_data: dict[str, Any]) -> None:
 
 
 def render_intelligence_feed(db_path: Path | str | None = None) -> None:
-    """Renders the functional multi-source Intelligence Feed (arXiv & Hacker News)."""
+    """Renders the functional multi-source Intelligence Feed (arXiv, Hacker News & GitHub Releases)."""
     target_path = db_path if db_path is not None else get_dashboard_db_path()
 
     st.markdown('<div class="pulse-title">Intelligence Feed</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="pulse-subtitle">Curated AI Research (arXiv) & Developer Discussions (Hacker News)</div>',
+        '<div class="pulse-subtitle">Curated AI Research (arXiv), Developer Discussions (Hacker News) & Releases (GitHub Releases)</div>',
         unsafe_allow_html=True,
     )
 
-    # 1. Source filter control (All Sources, arXiv, Hacker News)
+    # 1. Source filter control (All Sources, arXiv, Hacker News, GitHub Releases)
     # Default is "All Sources"
-    filter_col1, _ = st.columns([2, 3])
+    filter_col1, _ = st.columns([3, 2])
     with filter_col1:
         selected_source = st.radio(
             "Filter by Source",
-            options=["All Sources", "arXiv", "Hacker News"],
+            options=["All Sources", "arXiv", "Hacker News", "GitHub Releases"],
             index=0,
             horizontal=True,
             key="intelligence_feed_source_filter",
@@ -614,7 +636,7 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
         )
         return
 
-    # 2. Metrics row showing total, arXiv, Hacker News, unread, and bookmarked
+    # 2. Metrics row showing total, arXiv, Hacker News, GitHub Releases, unread, and bookmarked
     render_feed_metrics_row(feed_data)
 
     items = feed_data.get("items", [])
@@ -633,11 +655,17 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 "No stories from Hacker News are currently stored in the database. "
                 "Trigger the <strong>n8n Hacker News pipeline</strong> to fetch and ingest stories."
             )
+        elif selected_source == "GitHub Releases":
+            empty_title = "No GitHub Releases Found"
+            empty_desc = (
+                "No releases from GitHub are currently stored in the database. "
+                "Trigger the <strong>n8n GitHub Releases pipeline</strong> to fetch and ingest releases."
+            )
         else:
             empty_title = "No Intelligence Items Found"
             empty_desc = (
                 "No intelligence items are currently stored in the database "
-                "(No arXiv Research Papers Found or Hacker News stories). "
+                "(No arXiv Research Papers Found, Hacker News stories, or GitHub releases). "
                 "Trigger the <strong>n8n automation pipeline</strong> to fetch and ingest records."
             )
 
@@ -653,7 +681,7 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
         )
         return
 
-    # 3. Render feed cards (arXiv papers & Hacker News stories)
+    # 3. Render feed cards (arXiv papers, Hacker News stories & GitHub releases)
     for item in items:
         with st.container(border=True):
             item_id = item["id"]
@@ -671,9 +699,15 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 st.markdown(f"#### {clean_title}")
 
             # Badges: Source label, Domain label, Publication date
-            is_hn = (source_label == "Hacker News")
-            source_bg = "#9A3412" if is_hn else "#1E3A8A"
-            source_fg = "#FDBA74" if is_hn else "#93C5FD"
+            if source_label == "GitHub Releases":
+                source_bg = "#581C87"
+                source_fg = "#E9D5FF"
+            elif source_label == "Hacker News":
+                source_bg = "#9A3412"
+                source_fg = "#FDBA74"
+            else:
+                source_bg = "#1E3A8A"
+                source_fg = "#93C5FD"
 
             domain_bg = "#4338CA" if domain_label == "dev-tools" else "#064E3B"
             domain_fg = "#C7D2FE" if domain_label == "dev-tools" else "#6EE7B7"
@@ -695,14 +729,24 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 unsafe_allow_html=True,
             )
 
-            # Expandable section: Abstract (for arXiv) or Story Text (for HN)
-            expander_title = "Abstract" if source_label == "arXiv" else "Story Text"
+            # Expandable section: Abstract (for arXiv), Story Text (for HN), or Release Notes (for GitHub Releases)
+            if source_label == "arXiv":
+                expander_title = "Abstract"
+            elif source_label == "GitHub Releases":
+                expander_title = "Release Notes"
+            else:
+                expander_title = "Story Text"
             cleaned_text = format_item_text(item.get("text") or item.get("summary"))
             with st.expander(expander_title, expanded=False):
                 st.markdown(cleaned_text)
 
             # Action toggles: Bookmark and Read/Unread
-            source_slug = "arxiv" if source_label == "arXiv" else "hn"
+            if source_label == "arXiv":
+                source_slug = "arxiv"
+            elif source_label == "GitHub Releases":
+                source_slug = "gh"
+            else:
+                source_slug = "hn"
             bm_key = f"{source_slug}_bm_{item_id}"
             read_key = f"{source_slug}_read_{item_id}"
 

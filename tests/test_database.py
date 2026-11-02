@@ -12,6 +12,8 @@ from services.database import (
     init_db,
     insert_item,
     insert_items,
+    upsert_item,
+    upsert_items,
     get_items,
     get_item_by_id,
     count_items,
@@ -343,3 +345,198 @@ def test_persistence_after_closing_and_reopening(tmp_path: Path):
         assert row["source_id"] == "persist_1"
     finally:
         conn.close()
+
+
+def test_github_releases_source_query_and_count(test_db_path: Path):
+    """Verifies storing and retrieving GitHub Releases items with domain='dev-tools'."""
+    releases = [
+        {
+            "source": "GitHub Releases",
+            "source_id": "gh_rel_1",
+            "domain": "dev-tools",
+            "title": "FastAPI v0.115.0",
+            "url": "https://github.com/tiangolo/fastapi/releases/tag/0.115.0",
+            "text": "Support for newest Pydantic versions.",
+            "is_read": 0,
+            "is_bookmarked": 1,
+        },
+        {
+            "source": "GitHub Releases",
+            "source_id": "gh_rel_2",
+            "domain": "dev-tools",
+            "title": "Streamlit v1.40.0",
+            "url": "https://github.com/streamlit/streamlit/releases/tag/1.40.0",
+            "text": "New interactive layout primitives.",
+            "is_read": 1,
+            "is_bookmarked": 0,
+        },
+    ]
+    inserted = insert_items(releases, db_path=test_db_path)
+    assert inserted == 2
+
+    assert count_items(source="GitHub Releases", db_path=test_db_path) == 2
+    assert count_items(source="GitHub Releases", domain="dev-tools", db_path=test_db_path) == 2
+    assert count_items(source="GitHub Releases", is_bookmarked=1, db_path=test_db_path) == 1
+    assert count_items(source="GitHub Releases", is_read=0, db_path=test_db_path) == 1
+
+    items = get_items(source="GitHub Releases", db_path=test_db_path)
+    assert len(items) == 2
+    assert all(it["source"] == "GitHub Releases" for it in items)
+    assert all(it["domain"] == "dev-tools" for it in items)
+
+
+def test_upsert_item_insertion_and_update(test_db_path: Path):
+    """Verifies upsert_item inserts new items and updates content fields when duplicate exists."""
+    item = {
+        "source": "arXiv",
+        "source_id": "2411.9999",
+        "domain": "AI research",
+        "title": "Initial Paper Title",
+        "url": "http://arxiv.org/abs/2411.9999v1",
+        "text": "Initial abstract text.",
+        "published_at": "2024-11-20T10:00:00Z",
+    }
+    item_id, action = upsert_item(item, db_path=test_db_path)
+    assert action == "inserted"
+    assert item_id is not None
+    assert count_items(db_path=test_db_path) == 1
+
+    # Update item with revised metadata
+    updated_item = {
+        "source": "arXiv",
+        "source_id": "2411.9999",
+        "domain": "AI research",
+        "title": "Revised Paper Title (v2)",
+        "url": "http://arxiv.org/abs/2411.9999v2",
+        "text": "Revised and expanded abstract text.",
+        "published_at": "2024-11-25T10:00:00Z",
+    }
+    updated_id, update_action = upsert_item(updated_item, db_path=test_db_path)
+    assert update_action == "updated"
+    assert updated_id == item_id
+    assert count_items(db_path=test_db_path) == 1
+
+    stored = get_item_by_id(item_id, db_path=test_db_path)
+    assert stored["title"] == "Revised Paper Title (v2)"
+    assert stored["url"] == "http://arxiv.org/abs/2411.9999v2"
+    assert stored["text"] == "Revised and expanded abstract text."
+    assert stored["published_at"] == "2024-11-25T10:00:00Z"
+
+
+def test_upsert_items_content_update_and_flag_preservation(test_db_path: Path):
+    """Verifies upsert_items updates content fields while strictly preserving is_bookmarked and is_read."""
+    initial_items = [
+        {
+            "source": "Hacker News",
+            "source_id": "hn_100",
+            "domain": "dev-tools",
+            "title": "Initial HN Post",
+            "url": "https://news.ycombinator.com/item?id=100",
+            "text": "Initial body.",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+        {
+            "source": "GitHub Releases",
+            "source_id": "gh_100",
+            "domain": "dev-tools",
+            "title": "Initial Release Title",
+            "url": "https://github.com/org/repo/releases/tag/v1",
+            "text": "Draft release notes.",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+    ]
+    res1 = upsert_items(initial_items, db_path=test_db_path)
+    assert res1 == {"inserted": 2, "updated": 0}
+
+    # User interacts with both items: sets bookmark and read flags
+    items = get_items(db_path=test_db_path)
+    hn_id = next(it["id"] for it in items if it["source"] == "Hacker News")
+    gh_id = next(it["id"] for it in items if it["source"] == "GitHub Releases")
+
+    update_bookmark_status(hn_id, 1, db_path=test_db_path)
+    update_read_status(hn_id, 1, db_path=test_db_path)
+    update_bookmark_status(gh_id, 1, db_path=test_db_path)
+
+    # Ingestion pipeline re-sends both with corrected titles, urls, descriptions, plus 1 brand new item
+    revised_batch = [
+        {
+            "source": "Hacker News",
+            "source_id": "hn_100",
+            "domain": "dev-tools",
+            "title": "Updated HN Post with Discussion",
+            "url": "https://news.ycombinator.com/item?id=100_revised",
+            "text": "Updated discussion body with insights.",
+            "is_read": 0,       # Incoming payload tries 0, should NOT overwrite user flag
+            "is_bookmarked": 0, # Incoming payload tries 0, should NOT overwrite user flag
+        },
+        {
+            "source": "GitHub Releases",
+            "source_id": "gh_100",
+            "domain": "dev-tools",
+            "title": "v1.0.0 Stable Production Release",
+            "url": "https://github.com/org/repo/releases/tag/v1.0.0",
+            "text": "Official release notes with breaking changes.",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+        {
+            "source": "arXiv",
+            "source_id": "arxiv_new_01",
+            "domain": "AI research",
+            "title": "Brand New arXiv Paper",
+            "url": "http://arxiv.org/abs/2411.5555",
+            "text": "New abstract.",
+        },
+    ]
+
+    res2 = upsert_items(revised_batch, db_path=test_db_path)
+    assert res2 == {"inserted": 1, "updated": 2}
+    assert count_items(db_path=test_db_path) == 3
+
+    # Verify HN item: content updated, user flags preserved
+    hn_stored = get_item_by_id(hn_id, db_path=test_db_path)
+    assert hn_stored["title"] == "Updated HN Post with Discussion"
+    assert hn_stored["url"] == "https://news.ycombinator.com/item?id=100_revised"
+    assert hn_stored["text"] == "Updated discussion body with insights."
+    assert hn_stored["is_bookmarked"] == 1
+    assert hn_stored["is_read"] == 1
+
+    # Verify GitHub item: content updated, bookmark preserved
+    gh_stored = get_item_by_id(gh_id, db_path=test_db_path)
+    assert gh_stored["title"] == "v1.0.0 Stable Production Release"
+    assert gh_stored["url"] == "https://github.com/org/repo/releases/tag/v1.0.0"
+    assert gh_stored["text"] == "Official release notes with breaking changes."
+    assert gh_stored["is_bookmarked"] == 1
+
+
+def test_upsert_items_same_batch_duplicates(test_db_path: Path):
+    """Verifies that multiple occurrences of the same (source, source_id) in a single batch upsert correctly."""
+    batch = [
+        {
+            "source": "GitHub Releases",
+            "source_id": "duplicate_in_batch",
+            "domain": "dev-tools",
+            "title": "First Version In Batch",
+            "url": "https://github.com/example/repo/releases/tag/v1",
+            "text": "First text.",
+        },
+        {
+            "source": "GitHub Releases",
+            "source_id": "duplicate_in_batch",
+            "domain": "dev-tools",
+            "title": "Final Corrected Version In Batch",
+            "url": "https://github.com/example/repo/releases/tag/v1-final",
+            "text": "Final text.",
+        },
+    ]
+    counts = upsert_items(batch, db_path=test_db_path)
+    assert counts == {"inserted": 1, "updated": 1}
+    assert count_items(db_path=test_db_path) == 1
+
+    items = get_items(db_path=test_db_path)
+    assert len(items) == 1
+    assert items[0]["title"] == "Final Corrected Version In Batch"
+    assert items[0]["url"] == "https://github.com/example/repo/releases/tag/v1-final"
+    assert items[0]["text"] == "Final text."
