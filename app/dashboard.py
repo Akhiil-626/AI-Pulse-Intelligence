@@ -389,7 +389,7 @@ def render_overview(db_path: Path | str | None = None) -> None:
         )
 
 
-SUPPORTED_SOURCES = ("arXiv", "Hacker News", "GitHub Releases")
+SUPPORTED_SOURCES = ("arXiv", "Hacker News", "GitHub Releases", "NVD CVE")
 
 
 def format_item_text(raw_text: str | None) -> str:
@@ -417,7 +417,7 @@ def fetch_feed_data(
 ) -> dict[str, Any]:
     """Fetches intelligence items and summary counts directly from the SQLite database.
 
-    Supports filtering by 'All Sources', 'arXiv', 'Hacker News', or 'GitHub Releases'.
+    Supports filtering by 'All Sources', 'arXiv', 'Hacker News', 'GitHub Releases', or 'NVD CVE'.
     """
     target_path = db_path if db_path is not None else get_dashboard_db_path()
     try:
@@ -425,17 +425,20 @@ def fetch_feed_data(
         total_arxiv = count_items(source="arXiv", db_path=target_path)
         total_hn = count_items(source="Hacker News", db_path=target_path)
         total_gh = count_items(source="GitHub Releases", db_path=target_path)
-        total_items = total_arxiv + total_hn + total_gh
+        total_nvd = count_items(source="NVD CVE", db_path=target_path)
+        total_items = total_arxiv + total_hn + total_gh + total_nvd
 
         unread_arxiv = count_items(source="arXiv", is_read=0, db_path=target_path)
         unread_hn = count_items(source="Hacker News", is_read=0, db_path=target_path)
         unread_gh = count_items(source="GitHub Releases", is_read=0, db_path=target_path)
-        unread_items = unread_arxiv + unread_hn + unread_gh
+        unread_nvd = count_items(source="NVD CVE", is_read=0, db_path=target_path)
+        unread_items = unread_arxiv + unread_hn + unread_gh + unread_nvd
 
         bookmarked_arxiv = count_items(source="arXiv", is_bookmarked=1, db_path=target_path)
         bookmarked_hn = count_items(source="Hacker News", is_bookmarked=1, db_path=target_path)
         bookmarked_gh = count_items(source="GitHub Releases", is_bookmarked=1, db_path=target_path)
-        bookmarked_items = bookmarked_arxiv + bookmarked_hn + bookmarked_gh
+        bookmarked_nvd = count_items(source="NVD CVE", is_bookmarked=1, db_path=target_path)
+        bookmarked_items = bookmarked_arxiv + bookmarked_hn + bookmarked_gh + bookmarked_nvd
 
         if selected_source == "arXiv":
             items = get_items(source="arXiv", limit=100, db_path=target_path)
@@ -443,6 +446,8 @@ def fetch_feed_data(
             items = get_items(source="Hacker News", limit=100, db_path=target_path)
         elif selected_source == "GitHub Releases":
             items = get_items(source="GitHub Releases", limit=100, db_path=target_path)
+        elif selected_source == "NVD CVE":
+            items = get_items(source="NVD CVE", limit=100, db_path=target_path)
         else:
             raw_items = get_items(limit=100, db_path=target_path)
             items = [it for it in raw_items if it.get("source") in SUPPORTED_SOURCES]
@@ -454,6 +459,8 @@ def fetch_feed_data(
             "total_hn": total_hn,
             "total_gh": total_gh,
             "total_github": total_gh,
+            "total_nvd": total_nvd,
+            "total_cve": total_nvd,
             "unread": unread_items,
             "bookmarked": bookmarked_items,
             # Backward compatibility fields
@@ -468,6 +475,8 @@ def fetch_feed_data(
             "total_hn": 0,
             "total_gh": 0,
             "total_github": 0,
+            "total_nvd": 0,
+            "total_cve": 0,
             "unread": 0,
             "bookmarked": 0,
             "total": 0,
@@ -522,10 +531,11 @@ def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
     arxiv_val = feed_data.get("total_arxiv", 0)
     hn_val = feed_data.get("total_hn", 0)
     gh_val = feed_data.get("total_gh", feed_data.get("total_github", 0))
+    nvd_val = feed_data.get("total_nvd", feed_data.get("total_cve", 0))
     unread_val = feed_data.get("unread", 0)
     bookmarked_val = feed_data.get("bookmarked", 0)
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 
     with col1:
         st.markdown(
@@ -579,6 +589,18 @@ def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
         st.markdown(
             f"""
             <div class="metric-card">
+                <div class="metric-label">NVD CVEs</div>
+                <div class="metric-value">{nvd_val}</div>
+                <div class="metric-note">Total CVE advisories</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col6:
+        st.markdown(
+            f"""
+            <div class="metric-card">
                 <div class="metric-label">Unread Items</div>
                 <div class="metric-value">{unread_val}</div>
                 <div class="metric-note">is_read = 0 (Awaiting review)</div>
@@ -587,7 +609,7 @@ def render_feed_metrics_row(feed_data: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
 
-    with col6:
+    with col7:
         st.markdown(
             f"""
             <div class="metric-card">
@@ -606,22 +628,22 @@ def render_arxiv_metrics_row(feed_data: dict[str, Any]) -> None:
 
 
 def render_intelligence_feed(db_path: Path | str | None = None) -> None:
-    """Renders the functional multi-source Intelligence Feed (arXiv, Hacker News & GitHub Releases)."""
+    """Renders the functional multi-source Intelligence Feed (arXiv, Hacker News, GitHub Releases & NVD CVE)."""
     target_path = db_path if db_path is not None else get_dashboard_db_path()
 
     st.markdown('<div class="pulse-title">Intelligence Feed</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="pulse-subtitle">Curated AI Research (arXiv), Developer Discussions (Hacker News) & Releases (GitHub Releases)</div>',
+        '<div class="pulse-subtitle">Curated AI Research (arXiv), Developer Discussions (Hacker News), Releases (GitHub Releases) & Vulnerabilities (NVD CVE)</div>',
         unsafe_allow_html=True,
     )
 
-    # 1. Source filter control (All Sources, arXiv, Hacker News, GitHub Releases)
+    # 1. Source filter control (All Sources, arXiv, Hacker News, GitHub Releases, NVD CVE)
     # Default is "All Sources"
     filter_col1, _ = st.columns([3, 2])
     with filter_col1:
         selected_source = st.radio(
             "Filter by Source",
-            options=["All Sources", "arXiv", "Hacker News", "GitHub Releases"],
+            options=["All Sources", "arXiv", "Hacker News", "GitHub Releases", "NVD CVE"],
             index=0,
             horizontal=True,
             key="intelligence_feed_source_filter",
@@ -636,7 +658,7 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
         )
         return
 
-    # 2. Metrics row showing total, arXiv, Hacker News, GitHub Releases, unread, and bookmarked
+    # 2. Metrics row showing total, arXiv, Hacker News, GitHub Releases, NVD CVEs, unread, and bookmarked
     render_feed_metrics_row(feed_data)
 
     items = feed_data.get("items", [])
@@ -661,11 +683,17 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 "No releases from GitHub are currently stored in the database. "
                 "Trigger the <strong>n8n GitHub Releases pipeline</strong> to fetch and ingest releases."
             )
+        elif selected_source == "NVD CVE":
+            empty_title = "No NVD CVE Advisories Found"
+            empty_desc = (
+                "No CVE advisories from NVD are currently stored in the database. "
+                "Trigger the <strong>n8n NVD CVE pipeline</strong> to fetch and ingest vulnerabilities."
+            )
         else:
             empty_title = "No Intelligence Items Found"
             empty_desc = (
                 "No intelligence items are currently stored in the database "
-                "(No arXiv Research Papers Found, Hacker News stories, or GitHub releases). "
+                "(No arXiv Research Papers Found, Hacker News stories, GitHub releases, or NVD CVEs). "
                 "Trigger the <strong>n8n automation pipeline</strong> to fetch and ingest records."
             )
 
@@ -681,7 +709,7 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
         )
         return
 
-    # 3. Render feed cards (arXiv papers, Hacker News stories & GitHub releases)
+    # 3. Render feed cards (arXiv papers, Hacker News stories, GitHub releases & NVD CVEs)
     for item in items:
         with st.container(border=True):
             item_id = item["id"]
@@ -689,8 +717,21 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
             domain_label = item.get("domain") or "General"
             pub_date = item.get("published_at") or "Unknown"
             title = item.get("title", "Untitled")
-            clean_title = title.replace("[", "\\[").replace("]", "\\]")
+            source_id = item.get("source_id", "")
             url = item.get("url")
+
+            # Title handling: For NVD CVE, display CVE ID prominently and truncate long descriptions
+            if source_label == "NVD CVE":
+                cve_id = source_id if source_id else "CVE"
+                raw_desc = title if title and title != "Untitled" else (item.get("text") or "Vulnerability advisory")
+                clean_raw = raw_desc.replace("[", "\\[").replace("]", "\\]")
+                truncated = clean_raw if len(clean_raw) <= 140 else clean_raw[:137].rstrip() + "..."
+                if clean_raw.startswith(cve_id):
+                    clean_title = truncated
+                else:
+                    clean_title = f"{cve_id}: {truncated}"
+            else:
+                clean_title = title.replace("[", "\\[").replace("]", "\\]")
 
             # Title: clickable link if URL exists and is non-empty; ordinary text if null or empty
             if url and str(url).strip():
@@ -699,7 +740,10 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 st.markdown(f"#### {clean_title}")
 
             # Badges: Source label, Domain label, Publication date
-            if source_label == "GitHub Releases":
+            if source_label == "NVD CVE":
+                source_bg = "#831843"
+                source_fg = "#FBCFE8"
+            elif source_label == "GitHub Releases":
                 source_bg = "#581C87"
                 source_fg = "#E9D5FF"
             elif source_label == "Hacker News":
@@ -709,8 +753,15 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 source_bg = "#1E3A8A"
                 source_fg = "#93C5FD"
 
-            domain_bg = "#4338CA" if domain_label == "dev-tools" else "#064E3B"
-            domain_fg = "#C7D2FE" if domain_label == "dev-tools" else "#6EE7B7"
+            if domain_label == "cybersecurity":
+                domain_bg = "#7F1D1D"
+                domain_fg = "#FCA5A5"
+            elif domain_label == "dev-tools":
+                domain_bg = "#4338CA"
+                domain_fg = "#C7D2FE"
+            else:
+                domain_bg = "#064E3B"
+                domain_fg = "#6EE7B7"
 
             st.markdown(
                 f"""
@@ -729,14 +780,16 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 unsafe_allow_html=True,
             )
 
-            # Expandable section: Abstract (for arXiv), Story Text (for HN), or Release Notes (for GitHub Releases)
+            # Expandable section: Abstract (for arXiv), Story Text (for HN), Release Notes (for GitHub Releases), or Full Vulnerability Description (for NVD CVE)
             if source_label == "arXiv":
                 expander_title = "Abstract"
             elif source_label == "GitHub Releases":
                 expander_title = "Release Notes"
+            elif source_label == "NVD CVE":
+                expander_title = "Full Vulnerability Description"
             else:
                 expander_title = "Story Text"
-            cleaned_text = format_item_text(item.get("text") or item.get("summary"))
+            cleaned_text = format_item_text(item.get("text") or item.get("summary") or item.get("title"))
             with st.expander(expander_title, expanded=False):
                 st.markdown(cleaned_text)
 
@@ -745,6 +798,8 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 source_slug = "arxiv"
             elif source_label == "GitHub Releases":
                 source_slug = "gh"
+            elif source_label == "NVD CVE":
+                source_slug = "nvd"
             else:
                 source_slug = "hn"
             bm_key = f"{source_slug}_bm_{item_id}"

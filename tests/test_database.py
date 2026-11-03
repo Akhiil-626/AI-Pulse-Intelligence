@@ -385,6 +385,46 @@ def test_github_releases_source_query_and_count(test_db_path: Path):
     assert all(it["domain"] == "dev-tools" for it in items)
 
 
+def test_nvd_cve_source_query_and_count(test_db_path: Path):
+    """Verifies storing and retrieving NVD CVE items with domain='cybersecurity'."""
+    cves = [
+        {
+            "source": "NVD CVE",
+            "source_id": "CVE-2025-62819",
+            "domain": "cybersecurity",
+            "title": "Buffer overflow in network stack leading to arbitrary code execution",
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-62819",
+            "text": "Detailed vulnerability description regarding buffer overflow in packet handling.",
+            "published_at": "2026-11-02T15:17:11.403",
+            "is_read": 0,
+            "is_bookmarked": 1,
+        },
+        {
+            "source": "NVD CVE",
+            "source_id": "CVE-2025-62820",
+            "domain": "cybersecurity",
+            "title": "Improper input validation in web console",
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-62820",
+            "text": "Cross-site scripting (XSS) vulnerability in admin portal.",
+            "published_at": "2026-11-02T16:00:00.000",
+            "is_read": 1,
+            "is_bookmarked": 0,
+        },
+    ]
+    inserted = insert_items(cves, db_path=test_db_path)
+    assert inserted == 2
+
+    assert count_items(source="NVD CVE", db_path=test_db_path) == 2
+    assert count_items(source="NVD CVE", domain="cybersecurity", db_path=test_db_path) == 2
+    assert count_items(source="NVD CVE", is_bookmarked=1, db_path=test_db_path) == 1
+    assert count_items(source="NVD CVE", is_read=0, db_path=test_db_path) == 1
+
+    items = get_items(source="NVD CVE", db_path=test_db_path)
+    assert len(items) == 2
+    assert all(it["source"] == "NVD CVE" for it in items)
+    assert all(it["domain"] == "cybersecurity" for it in items)
+
+
 def test_upsert_item_insertion_and_update(test_db_path: Path):
     """Verifies upsert_item inserts new items and updates content fields when duplicate exists."""
     item = {

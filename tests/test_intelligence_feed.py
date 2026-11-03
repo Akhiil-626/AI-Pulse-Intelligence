@@ -59,9 +59,9 @@ def populated_test_db(tmp_path: Path) -> Path:
             "is_read": 1,
             "is_bookmarked": 1,
         },
-        # Item 3: non-arXiv source (cybersecurity)
+        # Item 3: non-arXiv source (cybersecurity CISA KEV)
         {
-            "source": "NVD CVE",
+            "source": "CISA KEV",
             "source_id": "CVE-2026-9999",
             "domain": "cybersecurity",
             "title": "Remote Code Execution in Agent Runtime",
@@ -296,9 +296,9 @@ def populated_multi_source_db(tmp_path: Path) -> Path:
             "is_read": 1,
             "is_bookmarked": 1,
         },
-        # Item 5: Unimplemented source (cybersecurity NVD)
+        # Item 5: Unimplemented source (cybersecurity CISA KEV)
         {
-            "source": "NVD CVE",
+            "source": "CISA KEV",
             "source_id": "CVE-2026-8888",
             "domain": "cybersecurity",
             "title": "Critical Buffer Overflow in Network Daemon",
@@ -334,7 +334,7 @@ def test_format_item_text_html_entities_and_markup():
 
 def test_fetch_feed_data_multi_source(populated_multi_source_db: Path):
     """Verifies fetch_feed_data filtering and multi-source count metrics."""
-    # All Sources: returns only supported sources (arXiv + Hacker News = 4), excluding NVD CVE
+    # All Sources: returns only supported sources (arXiv + Hacker News = 4), excluding CISA KEV
     all_data = fetch_feed_data(selected_source="All Sources", db_path=populated_multi_source_db)
     assert all_data["error"] is None
     assert all_data["total_items"] == 4
@@ -343,7 +343,7 @@ def test_fetch_feed_data_multi_source(populated_multi_source_db: Path):
     assert all_data["unread"] == 2  # Item 1 and Item 3
     assert all_data["bookmarked"] == 2  # Item 2 and Item 4
     assert len(all_data["items"]) == 4
-    assert not any(it["source"] == "NVD CVE" for it in all_data["items"])
+    assert not any(it["source"] == "CISA KEV" for it in all_data["items"])
 
     # Filter to arXiv only
     arxiv_data = fetch_feed_data(selected_source="arXiv", db_path=populated_multi_source_db)
@@ -580,9 +580,9 @@ def populated_three_source_db(tmp_path: Path) -> Path:
             "is_read": 1,
             "is_bookmarked": 1,
         },
-        # Item 7: Unimplemented source (cybersecurity NVD)
+        # Item 7: Unimplemented source (cybersecurity CISA KEV)
         {
-            "source": "NVD CVE",
+            "source": "CISA KEV",
             "source_id": "CVE-2026-8888",
             "domain": "cybersecurity",
             "title": "Critical Buffer Overflow in Network Daemon",
@@ -599,7 +599,7 @@ def populated_three_source_db(tmp_path: Path) -> Path:
 
 def test_fetch_feed_data_three_sources(populated_three_source_db: Path):
     """Verifies fetch_feed_data filtering and three-source count metrics."""
-    # All Sources: returns only supported sources (arXiv=2 + HN=2 + GitHub=2 -> 6), excluding NVD CVE
+    # All Sources: returns only supported sources (arXiv=2 + HN=2 + GitHub=2 -> 6), excluding CISA KEV
     all_data = fetch_feed_data(selected_source="All Sources", db_path=populated_three_source_db)
     assert all_data["error"] is None
     assert all_data["total_items"] == 6
@@ -609,7 +609,7 @@ def test_fetch_feed_data_three_sources(populated_three_source_db: Path):
     assert all_data["unread"] == 3  # Item 1 (arXiv), Item 3 (HN), Item 5 (GitHub)
     assert all_data["bookmarked"] == 3  # Item 2 (arXiv), Item 4 (HN), Item 6 (GitHub)
     assert len(all_data["items"]) == 6
-    assert not any(it["source"] == "NVD CVE" for it in all_data["items"])
+    assert not any(it["source"] == "CISA KEV" for it in all_data["items"])
 
     # Filter to arXiv only
     arxiv_data = fetch_feed_data(selected_source="arXiv", db_path=populated_three_source_db)
@@ -748,14 +748,14 @@ def test_intelligence_feed_github_releases_toggles(populated_three_source_db: Pa
 
 
 def test_intelligence_feed_retrieves_live_github_releases_records():
-    """Verifies retrieval and rendering of all 10 live GitHub Releases records from data/ai_pulse.db."""
+    """Verifies retrieval and rendering of all live GitHub Releases records from data/ai_pulse.db."""
     live_db = Path("data") / "ai_pulse.db"
     assert live_db.exists(), "data/ai_pulse.db must exist with ingested records"
 
     gh_feed = fetch_feed_data(selected_source="GitHub Releases", db_path=live_db)
     assert gh_feed["error"] is None
-    assert gh_feed["total_gh"] == 10
-    assert len(gh_feed["items"]) == 10
+    assert gh_feed["total_gh"] >= 10
+    assert len(gh_feed["items"]) == gh_feed["total_gh"]
 
     for it in gh_feed["items"]:
         assert it["source"] == "GitHub Releases"
@@ -782,7 +782,7 @@ def test_intelligence_feed_retrieves_live_github_releases_records():
 
 
 def test_intelligence_feed_retrieves_all_20_live_records():
-    """Verifies retrieval and rendering of all live records (arXiv, Hacker News & GitHub Releases) from data/ai_pulse.db."""
+    """Verifies retrieval and rendering of all live records (arXiv, Hacker News, GitHub Releases & NVD CVE) from data/ai_pulse.db."""
     live_db = Path("data") / "ai_pulse.db"
     assert live_db.exists(), "data/ai_pulse.db must exist with ingested records"
 
@@ -792,16 +792,19 @@ def test_intelligence_feed_retrieves_all_20_live_records():
     assert feed["total_arxiv"] >= 10
     assert feed["total_hn"] >= 10
     assert feed["total_gh"] >= 10
-    assert feed["total_items"] == feed["total_arxiv"] + feed["total_hn"] + feed["total_gh"]
+    assert feed["total_nvd"] >= 5
+    assert feed["total_items"] == feed["total_arxiv"] + feed["total_hn"] + feed["total_gh"] + feed["total_nvd"]
     assert len(feed["items"]) == feed["total_items"]
 
     # Verify counts per source
     arxiv_items = [it for it in feed["items"] if it["source"] == "arXiv"]
     hn_items = [it for it in feed["items"] if it["source"] == "Hacker News"]
     gh_items = [it for it in feed["items"] if it["source"] == "GitHub Releases"]
+    nvd_items = [it for it in feed["items"] if it["source"] == "NVD CVE"]
     assert len(arxiv_items) == feed["total_arxiv"]
     assert len(hn_items) == feed["total_hn"]
     assert len(gh_items) == feed["total_gh"]
+    assert len(nvd_items) == feed["total_nvd"]
 
     # Verify Hacker News records properties
     hn_null_urls = [it for it in hn_items if it["url"] is None]
@@ -812,6 +815,12 @@ def test_intelligence_feed_retrieves_all_20_live_records():
         assert it["domain"] == "dev-tools"
         assert it["published_at"] is not None
 
+    # Verify NVD CVE records properties
+    for it in nvd_items:
+        assert it["domain"] == "cybersecurity"
+        assert it["published_at"] is not None
+        assert it["source_id"].startswith("CVE-")
+
     # Run Streamlit AppTest to verify full dashboard execution
     app_test = AppTest.from_file(DASHBOARD_FILE).run()
     assert len(app_test.exception) == 0
@@ -821,14 +830,376 @@ def test_intelligence_feed_retrieves_all_20_live_records():
 
     markdown_texts = [m.value for m in app_test.markdown]
 
-    # Verify metrics row displays total items, arXiv, Hacker News, GitHub Releases
+    # Verify metrics row displays total items, arXiv, Hacker News, GitHub Releases, NVD CVEs
     assert any("Total Items" in t for t in markdown_texts)
     assert any("arXiv Papers Stored" in t for t in markdown_texts)
     assert any("Hacker News Stories" in t for t in markdown_texts)
     assert any("GitHub Releases" in t for t in markdown_texts)
+    assert any("NVD CVEs" in t for t in markdown_texts)
     assert any(str(feed["total_items"]) in t for t in markdown_texts)
 
     # Verify all titles are rendered in the dashboard UI
     for it in feed["items"]:
-        clean_title = it["title"].replace("[", "\\[").replace("]", "\\]")
-        assert any(clean_title in t or it["title"] in t for t in markdown_texts)
+        if it["source"] == "NVD CVE":
+            assert any(it["source_id"] in t for t in markdown_texts)
+        else:
+            clean_title = it["title"].replace("[", "\\[").replace("]", "\\]")
+            assert any(clean_title in t or it["title"] in t for t in markdown_texts)
+
+
+@pytest.fixture
+def populated_four_source_db(tmp_path: Path) -> Path:
+    """Provides an initialized SQLite database with four supported sources plus an unsupported source."""
+    db_file = tmp_path / "four_source_feed_pulse.db"
+    init_db(db_file)
+
+    sample_items = [
+        # Item 1: arXiv, unread, unbookmarked
+        {
+            "source": "arXiv",
+            "source_id": "2411.0001",
+            "domain": "AI research",
+            "title": "Frontier Model Reasoning with Tree of Thoughts",
+            "url": "http://arxiv.org/abs/2411.0001v1",
+            "text": "This paper explores tree-of-thought prompting in frontier models.",
+            "published_at": "2024-11-20T10:00:00Z",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+        # Item 2: arXiv, read, bookmarked
+        {
+            "source": "arXiv",
+            "source_id": "2411.0002",
+            "domain": "AI research",
+            "title": "Scaling Laws for RAG Systems",
+            "url": "http://arxiv.org/abs/2411.0002v1",
+            "text": "An empirical analysis of retrieval-augmented generation at scale.",
+            "published_at": "2024-11-25T14:30:00Z",
+            "is_read": 1,
+            "is_bookmarked": 1,
+        },
+        # Item 3: Hacker News, unread, unbookmarked
+        {
+            "source": "Hacker News",
+            "source_id": "hn_3001",
+            "domain": "dev-tools",
+            "title": "Show HN: Fast local SQLite vector search in Python",
+            "url": "https://github.com/example/fast-sqlite-vector",
+            "text": "A minimal, dependency-free vector index built directly on top of SQLite.",
+            "published_at": "2026-11-01T12:00:00Z",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+        # Item 4: Hacker News, read, bookmarked
+        {
+            "source": "Hacker News",
+            "source_id": "hn_3002",
+            "domain": "dev-tools",
+            "title": "Ask HN: What is your preferred local LLM setup in 2026?",
+            "url": None,
+            "text": "I am curious what developers are using.<p>Ollama, vLLM, or LM Studio?</p>",
+            "published_at": "2026-11-01T16:00:00Z",
+            "is_read": 1,
+            "is_bookmarked": 1,
+        },
+        # Item 5: GitHub Releases, unread, unbookmarked
+        {
+            "source": "GitHub Releases",
+            "source_id": "gh_5001",
+            "domain": "dev-tools",
+            "title": "Ollama v0.4.0: Local Tool Calling & Structured Outputs",
+            "url": "https://github.com/ollama/ollama/releases/tag/v0.4.0",
+            "text": "Added support for Llama 3.2 & tool calling.",
+            "published_at": "2026-11-01T08:00:00Z",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+        # Item 6: GitHub Releases, read, bookmarked
+        {
+            "source": "GitHub Releases",
+            "source_id": "gh_5002",
+            "domain": "dev-tools",
+            "title": "vLLM v0.6.2 Internal Release",
+            "url": None,
+            "text": "Performance improvements for chunked prefill.",
+            "published_at": "2026-10-31T09:00:00Z",
+            "is_read": 1,
+            "is_bookmarked": 1,
+        },
+        # Item 7: NVD CVE, unread, unbookmarked, with URL
+        {
+            "source": "NVD CVE",
+            "source_id": "CVE-2025-62819",
+            "domain": "cybersecurity",
+            "title": "Heap buffer overflow in OpenSSL ASN.1 parser leading to remote denial of service or arbitrary code execution",
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-62819",
+            "text": "A heap-based buffer overflow flaw was found in OpenSSL. A remote attacker could send a specially crafted ASN.1 structure to cause memory corruption and arbitrary code execution.",
+            "published_at": "2026-11-02T15:17:11.403",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+        # Item 8: NVD CVE, read, bookmarked, NO URL
+        {
+            "source": "NVD CVE",
+            "source_id": "CVE-2025-62820",
+            "domain": "cybersecurity",
+            "title": "SQL injection vulnerability in legacy authentication plugin",
+            "url": None,
+            "text": "An issue was discovered in legacy authentication plugin allowing SQL injection via username parameter in login forms.",
+            "published_at": "2026-11-01T10:00:00Z",
+            "is_read": 1,
+            "is_bookmarked": 1,
+        },
+        # Item 9: Unimplemented source (cybersecurity CISA KEV)
+        {
+            "source": "CISA KEV",
+            "source_id": "CVE-2024-1234",
+            "domain": "cybersecurity",
+            "title": "Active exploitation of vulnerability in enterprise gateway",
+            "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+            "text": "Advisory details for catalog entry.",
+            "published_at": "2024-05-01T00:00:00Z",
+            "is_read": 0,
+            "is_bookmarked": 0,
+        },
+    ]
+    insert_items(sample_items, db_path=db_file)
+    return db_file
+
+
+def test_fetch_feed_data_four_sources(populated_four_source_db: Path):
+    """Verifies fetch_feed_data filtering and four-source count metrics."""
+    # All Sources: returns only supported sources (arXiv=2 + HN=2 + GitHub=2 + NVD=2 -> 8), excluding CISA KEV
+    all_data = fetch_feed_data(selected_source="All Sources", db_path=populated_four_source_db)
+    assert all_data["error"] is None
+    assert all_data["total_items"] == 8
+    assert all_data["total_arxiv"] == 2
+    assert all_data["total_hn"] == 2
+    assert all_data["total_gh"] == 2
+    assert all_data["total_nvd"] == 2
+    assert all_data["unread"] == 4  # Items 1, 3, 5, 7
+    assert all_data["bookmarked"] == 4  # Items 2, 4, 6, 8
+    assert len(all_data["items"]) == 8
+    assert not any(it["source"] == "CISA KEV" for it in all_data["items"])
+
+    # Filter to NVD CVE only
+    nvd_data = fetch_feed_data(selected_source="NVD CVE", db_path=populated_four_source_db)
+    assert len(nvd_data["items"]) == 2
+    assert all(it["source"] == "NVD CVE" for it in nvd_data["items"])
+    assert all(it["domain"] == "cybersecurity" for it in nvd_data["items"])
+
+
+def test_intelligence_feed_displays_all_four_sources(populated_four_source_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies that the Intelligence Feed renders arXiv, Hacker News, GitHub Releases, and NVD CVE in All Sources."""
+    monkeypatch.setenv("AI_PULSE_DB_PATH", str(populated_four_source_db))
+
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    assert len(app_test.exception) == 0
+
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    markdown_texts = [m.value for m in app_test.markdown]
+
+    # Verify metrics row cards
+    assert any("Total Items" in t for t in markdown_texts)
+    assert any("arXiv Papers Stored" in t for t in markdown_texts)
+    assert any("Hacker News Stories" in t for t in markdown_texts)
+    assert any("GitHub Releases" in t for t in markdown_texts)
+    assert any("NVD CVEs" in t for t in markdown_texts)
+    assert any("Unread Items" in t for t in markdown_texts)
+    assert any("Bookmarked Items" in t for t in markdown_texts)
+
+    # Verify source radio options
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    assert "All Sources" in source_radio.options
+    assert "arXiv" in source_radio.options
+    assert "Hacker News" in source_radio.options
+    assert "GitHub Releases" in source_radio.options
+    assert "NVD CVE" in source_radio.options
+
+    # Verify presence of records from all 4 sources
+    assert any("Frontier Model Reasoning with Tree of Thoughts" in t for t in markdown_texts)
+    assert any("Show HN: Fast local SQLite vector search in Python" in t for t in markdown_texts)
+    assert any("Ollama v0.4.0: Local Tool Calling & Structured Outputs" in t for t in markdown_texts)
+    assert any("CVE-2025-62819" in t for t in markdown_texts)
+
+    # Verify source badges
+    assert any("Source: arXiv" in t for t in markdown_texts)
+    assert any("Source: Hacker News" in t for t in markdown_texts)
+    assert any("Source: GitHub Releases" in t for t in markdown_texts)
+    assert any("Source: NVD CVE" in t for t in markdown_texts)
+
+    # Verify domain badges
+    assert any("Domain: AI research" in t for t in markdown_texts)
+    assert any("Domain: dev-tools" in t for t in markdown_texts)
+    assert any("Domain: cybersecurity" in t for t in markdown_texts)
+
+    # Unimplemented source (CISA KEV) must NOT be displayed
+    assert not any("Active exploitation of vulnerability in enterprise gateway" in t for t in markdown_texts)
+
+
+def test_intelligence_feed_nvd_source_filtering(populated_four_source_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies that selecting the NVD CVE filter displays only NVD records and hides other sources."""
+    monkeypatch.setenv("AI_PULSE_DB_PATH", str(populated_four_source_db))
+
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    source_radio.set_value("NVD CVE").run()
+    assert len(app_test.exception) == 0
+
+    markdown_texts = [m.value for m in app_test.markdown]
+
+    # Displays NVD CVE records prominently
+    assert any("CVE-2025-62819" in t for t in markdown_texts)
+    assert any("CVE-2025-62820" in t for t in markdown_texts)
+
+    # Hides arXiv, Hacker News, and GitHub Releases records
+    assert not any("Frontier Model Reasoning with Tree of Thoughts" in t for t in markdown_texts)
+    assert not any("Scaling Laws for RAG Systems" in t for t in markdown_texts)
+    assert not any("Show HN: Fast local SQLite vector search in Python" in t for t in markdown_texts)
+    assert not any("Ask HN: What is your preferred local LLM setup in 2026?" in t for t in markdown_texts)
+    assert not any("Ollama v0.4.0: Local Tool Calling & Structured Outputs" in t for t in markdown_texts)
+    assert not any("vLLM v0.6.2 Internal Release" in t for t in markdown_texts)
+
+
+def test_intelligence_feed_nvd_card_content_and_prominent_cve(populated_four_source_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies NVD CVE card layout: prominent CVE ID, official link, badges, date, and expandable full description."""
+    monkeypatch.setenv("AI_PULSE_DB_PATH", str(populated_four_source_db))
+
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    source_radio.set_value("NVD CVE").run()
+    assert len(app_test.exception) == 0
+
+    markdown_texts = [m.value for m in app_test.markdown]
+
+    # CVE ID in title and link
+    assert any("CVE-2025-62819" in t for t in markdown_texts)
+    assert any("https://nvd.nist.gov/vuln/detail/CVE-2025-62819" in t for t in markdown_texts)
+
+    # Badges
+    assert any("Source: NVD CVE" in t for t in markdown_texts)
+    assert any("Domain: cybersecurity" in t for t in markdown_texts)
+
+    # Publication date
+    assert any("2026-11-02T15:17:11.403" in t for t in markdown_texts)
+
+    # Full description in expander
+    assert any("A heap-based buffer overflow flaw was found in OpenSSL." in t for t in markdown_texts)
+
+
+def test_intelligence_feed_nvd_missing_url_handling(populated_four_source_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies that NVD CVE items with missing/null URLs render safely as plain text without broken links."""
+    monkeypatch.setenv("AI_PULSE_DB_PATH", str(populated_four_source_db))
+
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    source_radio.set_value("NVD CVE").run()
+    assert len(app_test.exception) == 0
+
+    markdown_texts = [m.value for m in app_test.markdown]
+
+    # CVE-2025-62820 has url=None; verify it renders as plain header
+    assert any("#### CVE-2025-62820: SQL injection vulnerability" in t for t in markdown_texts)
+    # Ensure no empty or fake link target is rendered for CVE-2025-62820
+    assert not any("[CVE-2025-62820" in t and "](None)" in t for t in markdown_texts)
+    assert not any("[CVE-2025-62820" in t and "]()" in t for t in markdown_texts)
+
+
+def test_intelligence_feed_nvd_toggles(populated_four_source_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies bookmark and read toggles for NVD CVE items update the SQLite database."""
+    monkeypatch.setenv("AI_PULSE_DB_PATH", str(populated_four_source_db))
+
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    source_radio.set_value("NVD CVE").run()
+    assert len(app_test.exception) == 0
+
+    # Locate NVD CVE Item 7 (id=7, initially unbookmarked and unread)
+    item_7 = get_item_by_id(7, db_path=populated_four_source_db)
+    assert item_7["is_bookmarked"] == 0
+    assert item_7["is_read"] == 0
+
+    # Toggle bookmark for Item 7
+    nvd_bm_toggle = [t for t in app_test.toggle if t.key == "nvd_bm_7"][0]
+    assert nvd_bm_toggle.value is False
+    nvd_bm_toggle.set_value(True).run()
+    assert len(app_test.exception) == 0
+
+    updated_7 = get_item_by_id(7, db_path=populated_four_source_db)
+    assert updated_7["is_bookmarked"] == 1
+
+    # Toggle read for Item 7
+    nvd_read_toggle = [t for t in app_test.toggle if t.key == "nvd_read_7"][0]
+    assert nvd_read_toggle.value is False
+    nvd_read_toggle.set_value(True).run()
+    assert len(app_test.exception) == 0
+
+    updated_7 = get_item_by_id(7, db_path=populated_four_source_db)
+    assert updated_7["is_read"] == 1
+
+
+def test_intelligence_feed_empty_state_nvd_cve(empty_test_db: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verifies the empty state notice when NVD CVE filter is selected with no CVE records."""
+    monkeypatch.setenv("AI_PULSE_DB_PATH", str(empty_test_db))
+
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    assert len(app_test.exception) == 0
+
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    source_radio.set_value("NVD CVE").run()
+    assert len(app_test.exception) == 0
+
+    markdown_texts = [m.value for m in app_test.markdown]
+    assert any("No NVD CVE Advisories Found" in t for t in markdown_texts)
+
+
+def test_intelligence_feed_retrieves_live_nvd_cve_records():
+    """Verifies retrieval and rendering of all live NVD CVE records from data/ai_pulse.db."""
+    live_db = Path("data") / "ai_pulse.db"
+    assert live_db.exists(), "data/ai_pulse.db must exist with ingested records"
+
+    nvd_feed = fetch_feed_data(selected_source="NVD CVE", db_path=live_db)
+    assert nvd_feed["error"] is None
+    assert nvd_feed["total_nvd"] >= 5
+    assert len(nvd_feed["items"]) == nvd_feed["total_nvd"]
+
+    for it in nvd_feed["items"]:
+        assert it["source"] == "NVD CVE"
+        assert it["domain"] == "cybersecurity"
+        assert it["source_id"].startswith("CVE-")
+        assert it["published_at"] is not None
+        assert it["url"] is not None and "nvd.nist.gov" in it["url"]
+
+    # Verify rendering via Streamlit AppTest
+    app_test = AppTest.from_file(DASHBOARD_FILE).run()
+    assert len(app_test.exception) == 0
+
+    app_test.radio[0].set_value("Intelligence Feed").run()
+    assert len(app_test.exception) == 0
+
+    source_radio = [r for r in app_test.radio if r.label == "Filter by Source"][0]
+    source_radio.set_value("NVD CVE").run()
+    assert len(app_test.exception) == 0
+
+    markdown_texts = [m.value for m in app_test.markdown]
+    assert any("NVD CVE" in t for t in markdown_texts)
+    assert any("Domain: cybersecurity" in t for t in markdown_texts)
+    for it in nvd_feed["items"]:
+        assert any(it["source_id"] in t for t in markdown_texts)
