@@ -20,6 +20,8 @@ from services.database import (
     update_read_status,
     update_bookmark_status,
     get_connection,
+    count_correlated_cves,
+    get_correlated_cves,
 )
 
 
@@ -580,3 +582,350 @@ def test_upsert_items_same_batch_duplicates(test_db_path: Path):
     assert items[0]["title"] == "Final Corrected Version In Batch"
     assert items[0]["url"] == "https://github.com/example/repo/releases/tag/v1-final"
     assert items[0]["text"] == "Final text."
+
+
+# ==============================================================================
+# Phase 4.2: CVE Correlation Tests (get_correlated_cves & count_correlated_cves)
+# ==============================================================================
+
+def test_correlated_cves_matching_both(test_db_path: Path):
+    """Verifies that a CVE present in both NVD CVE and CISA KEV returns status 'both'."""
+    nvd_item = {
+        "source": "NVD CVE",
+        "source_id": "CVE-2026-0001",
+        "domain": "cybersecurity",
+        "title": "NVD Description for Flaw",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-0001",
+        "text": "Technical flaw details.",
+        "published_at": "2026-01-10T12:00:00Z",
+        "is_read": 1,
+        "is_bookmarked": 0,
+    }
+    cisa_item = {
+        "source": "CISA KEV",
+        "source_id": "CVE-2026-0001",
+        "domain": "cybersecurity",
+        "title": "Vendor Product RCE",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-0001",
+        "text": "Known exploited in wild advisory.",
+        "published_at": "2026-01-15",
+        "is_read": 0,
+        "is_bookmarked": 1,
+    }
+    insert_items([nvd_item, cisa_item], db_path=test_db_path)
+
+    assert count_correlated_cves("all", db_path=test_db_path) == 1
+    assert count_correlated_cves("both", db_path=test_db_path) == 1
+    assert count_correlated_cves("nvd_only", db_path=test_db_path) == 0
+    assert count_correlated_cves("cisa_only", db_path=test_db_path) == 0
+
+    results = get_correlated_cves(filter_status="both", db_path=test_db_path)
+    assert len(results) == 1
+    row = results[0]
+    assert row["cve_id"] == "CVE-2026-0001"
+    assert row["correlation_status"] == "both"
+    assert row["nvd_id"] is not None
+    assert row["nvd_title"] == "NVD Description for Flaw"
+    assert row["nvd_published_at"] == "2026-01-10T12:00:00Z"
+    assert row["cisa_id"] is not None
+    assert row["cisa_title"] == "Vendor Product RCE"
+    assert row["cisa_date_added"] == "2026-01-15"
+
+
+def test_correlated_cves_nvd_only(test_db_path: Path):
+    """Verifies that an NVD-only CVE returns status 'nvd_only' with None for CISA fields."""
+    nvd_item = {
+        "source": "NVD CVE",
+        "source_id": "CVE-2026-0002",
+        "domain": "cybersecurity",
+        "title": "Buffer overflow in demo component",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-0002",
+        "text": "Heap buffer overflow.",
+        "published_at": "2026-02-01T08:00:00Z",
+    }
+    insert_item(nvd_item, db_path=test_db_path)
+
+    assert count_correlated_cves("all", db_path=test_db_path) == 1
+    assert count_correlated_cves("both", db_path=test_db_path) == 0
+    assert count_correlated_cves("nvd_only", db_path=test_db_path) == 1
+    assert count_correlated_cves("cisa_only", db_path=test_db_path) == 0
+
+    results = get_correlated_cves(filter_status="nvd_only", db_path=test_db_path)
+    assert len(results) == 1
+    row = results[0]
+    assert row["cve_id"] == "CVE-2026-0002"
+    assert row["correlation_status"] == "nvd_only"
+    assert row["nvd_id"] is not None
+    assert row["nvd_title"] == "Buffer overflow in demo component"
+    assert row["cisa_id"] is None
+    assert row["cisa_title"] is None
+    assert row["cisa_url"] is None
+    assert row["cisa_text"] is None
+    assert row["cisa_date_added"] is None
+    assert row["cisa_is_read"] is None
+    assert row["cisa_is_bookmarked"] is None
+
+
+def test_correlated_cves_cisa_only(test_db_path: Path):
+    """Verifies that a CISA-only CVE returns status 'cisa_only' with None for NVD fields."""
+    cisa_item = {
+        "source": "CISA KEV",
+        "source_id": "CVE-2026-0003",
+        "domain": "cybersecurity",
+        "title": "Legacy Server Remote Code Execution",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-0003",
+        "text": "Known exploited advisory from catalog.",
+        "published_at": "2026-02-15",
+    }
+    insert_item(cisa_item, db_path=test_db_path)
+
+    assert count_correlated_cves("all", db_path=test_db_path) == 1
+    assert count_correlated_cves("both", db_path=test_db_path) == 0
+    assert count_correlated_cves("nvd_only", db_path=test_db_path) == 0
+    assert count_correlated_cves("cisa_only", db_path=test_db_path) == 1
+
+    results = get_correlated_cves(filter_status="cisa_only", db_path=test_db_path)
+    assert len(results) == 1
+    row = results[0]
+    assert row["cve_id"] == "CVE-2026-0003"
+    assert row["correlation_status"] == "cisa_only"
+    assert row["cisa_id"] is not None
+    assert row["cisa_title"] == "Legacy Server Remote Code Execution"
+    assert row["cisa_date_added"] == "2026-02-15"
+    assert row["nvd_id"] is None
+    assert row["nvd_title"] is None
+    assert row["nvd_url"] is None
+    assert row["nvd_text"] is None
+    assert row["nvd_published_at"] is None
+    assert row["nvd_is_read"] is None
+    assert row["nvd_is_bookmarked"] is None
+
+
+def test_correlated_cves_all_returns_distinct_rows(test_db_path: Path):
+    """Verifies that 'all' returns exactly one row per distinct CVE across both sources."""
+    items = [
+        # CVE 1: both
+        {"source": "NVD CVE", "source_id": "CVE-2026-0010", "domain": "cybersecurity", "title": "NVD 10"},
+        {"source": "CISA KEV", "source_id": "CVE-2026-0010", "domain": "cybersecurity", "title": "CISA 10"},
+        # CVE 2: NVD only
+        {"source": "NVD CVE", "source_id": "CVE-2026-0020", "domain": "cybersecurity", "title": "NVD 20"},
+        # CVE 3: CISA only
+        {"source": "CISA KEV", "source_id": "CVE-2026-0030", "domain": "cybersecurity", "title": "CISA 30"},
+    ]
+    insert_items(items, db_path=test_db_path)
+
+    assert count_correlated_cves("all", db_path=test_db_path) == 3
+    results = get_correlated_cves(filter_status="all", db_path=test_db_path)
+    assert len(results) == 3
+
+    cve_ids = {r["cve_id"] for r in results}
+    assert cve_ids == {"CVE-2026-0010", "CVE-2026-0020", "CVE-2026-0030"}
+
+    status_by_id = {r["cve_id"]: r["correlation_status"] for r in results}
+    assert status_by_id["CVE-2026-0010"] == "both"
+    assert status_by_id["CVE-2026-0020"] == "nvd_only"
+    assert status_by_id["CVE-2026-0030"] == "cisa_only"
+
+
+def test_correlated_cves_excludes_other_sources(test_db_path: Path):
+    """Verifies that items from arXiv, Hacker News, and GitHub Releases are excluded from CVE correlation."""
+    mixed_items = [
+        {"source": "arXiv", "source_id": "2411.9999", "domain": "AI research", "title": "Paper on LLMs"},
+        {"source": "Hacker News", "source_id": "50999999", "domain": "dev-tools", "title": "Show HN: Tool"},
+        {"source": "GitHub Releases", "source_id": "49999999", "domain": "dev-tools", "title": "Release 1.0"},
+        {"source": "NVD CVE", "source_id": "CVE-2026-0040", "domain": "cybersecurity", "title": "NVD 40"},
+    ]
+    insert_items(mixed_items, db_path=test_db_path)
+
+    assert count_items(db_path=test_db_path) == 4
+    assert count_correlated_cves("all", db_path=test_db_path) == 1
+    results = get_correlated_cves(filter_status="all", db_path=test_db_path)
+    assert len(results) == 1
+    assert results[0]["cve_id"] == "CVE-2026-0040"
+
+
+def test_correlated_cves_duplicate_upsert_prevention(test_db_path: Path):
+    """Verifies that re-ingesting or upserting records does not create duplicate correlation rows."""
+    initial = [
+        {"source": "NVD CVE", "source_id": "CVE-2026-0050", "domain": "cybersecurity", "title": "Initial Title"},
+        {"source": "CISA KEV", "source_id": "CVE-2026-0050", "domain": "cybersecurity", "title": "Initial CISA"},
+    ]
+    upsert_items(initial, db_path=test_db_path)
+    assert count_correlated_cves("all", db_path=test_db_path) == 1
+
+    # Re-upsert with updated content
+    updated = [
+        {"source": "NVD CVE", "source_id": "CVE-2026-0050", "domain": "cybersecurity", "title": "Updated Title"},
+        {"source": "CISA KEV", "source_id": "CVE-2026-0050", "domain": "cybersecurity", "title": "Updated CISA"},
+    ]
+    upsert_items(updated, db_path=test_db_path)
+
+    assert count_correlated_cves("all", db_path=test_db_path) == 1
+    results = get_correlated_cves(filter_status="all", db_path=test_db_path)
+    assert len(results) == 1
+    assert results[0]["nvd_title"] == "Updated Title"
+    assert results[0]["cisa_title"] == "Updated CISA"
+
+
+def test_correlated_cves_metadata_attribution(test_db_path: Path):
+    """Verifies that NVD and CISA metadata remain strictly attributed to their respective columns."""
+    items = [
+        {
+            "source": "NVD CVE",
+            "source_id": "CVE-2026-0060",
+            "domain": "cybersecurity",
+            "title": "NVD Unique Advisory Title",
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-0060",
+            "text": "NVD technical advisory body text.",
+            "published_at": "2026-03-01T10:00:00.000",
+        },
+        {
+            "source": "CISA KEV",
+            "source_id": "CVE-2026-0060",
+            "domain": "cybersecurity",
+            "title": "CISA Unique Vulnerability Name",
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-0060",
+            "text": "CISA catalog description and action required.",
+            "published_at": "2026-03-10",
+        },
+    ]
+    insert_items(items, db_path=test_db_path)
+
+    results = get_correlated_cves(filter_status="both", db_path=test_db_path)
+    assert len(results) == 1
+    row = results[0]
+
+    # Explicit attribution checks
+    assert row["nvd_title"] == "NVD Unique Advisory Title"
+    assert row["nvd_text"] == "NVD technical advisory body text."
+    assert row["nvd_published_at"] == "2026-03-01T10:00:00.000"
+
+    assert row["cisa_title"] == "CISA Unique Vulnerability Name"
+    assert row["cisa_text"] == "CISA catalog description and action required."
+    assert row["cisa_date_added"] == "2026-03-10"
+
+
+def test_correlated_cves_independent_read_bookmark_states(test_db_path: Path):
+    """Verifies that read and bookmark toggles on NVD record do not alter CISA record and vice versa."""
+    nvd_item = {
+        "source": "NVD CVE",
+        "source_id": "CVE-2026-0070",
+        "domain": "cybersecurity",
+        "title": "NVD Item",
+        "is_read": 0,
+        "is_bookmarked": 0,
+    }
+    cisa_item = {
+        "source": "CISA KEV",
+        "source_id": "CVE-2026-0070",
+        "domain": "cybersecurity",
+        "title": "CISA Item",
+        "is_read": 0,
+        "is_bookmarked": 0,
+    }
+    insert_items([nvd_item, cisa_item], db_path=test_db_path)
+
+    results = get_correlated_cves(filter_status="both", db_path=test_db_path)
+    nvd_id = results[0]["nvd_id"]
+    cisa_id = results[0]["cisa_id"]
+
+    # Toggle NVD to read=1, bookmarked=1; CISA remains 0
+    update_read_status(nvd_id, 1, db_path=test_db_path)
+    update_bookmark_status(nvd_id, 1, db_path=test_db_path)
+
+    results_after_nvd = get_correlated_cves(filter_status="both", db_path=test_db_path)
+    assert results_after_nvd[0]["nvd_is_read"] == 1
+    assert results_after_nvd[0]["nvd_is_bookmarked"] == 1
+    assert results_after_nvd[0]["cisa_is_read"] == 0
+    assert results_after_nvd[0]["cisa_is_bookmarked"] == 0
+
+    # Toggle CISA to read=1; CISA bookmarked remains 0
+    update_read_status(cisa_id, 1, db_path=test_db_path)
+
+    results_after_cisa = get_correlated_cves(filter_status="both", db_path=test_db_path)
+    assert results_after_cisa[0]["nvd_is_read"] == 1
+    assert results_after_cisa[0]["nvd_is_bookmarked"] == 1
+    assert results_after_cisa[0]["cisa_is_read"] == 1
+    assert results_after_cisa[0]["cisa_is_bookmarked"] == 0
+
+
+def test_correlated_cves_pagination_and_counting(test_db_path: Path):
+    """Verifies limit, offset, and count across multiple statuses."""
+    items = []
+    # 5 NVD-only
+    for i in range(1, 6):
+        items.append({
+            "source": "NVD CVE",
+            "source_id": f"CVE-2026-100{i}",
+            "domain": "cybersecurity",
+            "title": f"NVD {i}",
+            "published_at": f"2026-01-0{i}",
+        })
+    # 3 CISA-only
+    for i in range(1, 4):
+        items.append({
+            "source": "CISA KEV",
+            "source_id": f"CVE-2026-200{i}",
+            "domain": "cybersecurity",
+            "title": f"CISA {i}",
+            "published_at": f"2026-02-0{i}",
+        })
+    # 2 Both
+    for i in range(1, 3):
+        items.append({
+            "source": "NVD CVE",
+            "source_id": f"CVE-2026-300{i}",
+            "domain": "cybersecurity",
+            "title": f"Both NVD {i}",
+            "published_at": f"2026-03-0{i}",
+        })
+        items.append({
+            "source": "CISA KEV",
+            "source_id": f"CVE-2026-300{i}",
+            "domain": "cybersecurity",
+            "title": f"Both CISA {i}",
+            "published_at": f"2026-03-1{i}",
+        })
+
+    insert_items(items, db_path=test_db_path)
+
+    # Total distinct CVEs = 5 + 3 + 2 = 10
+    assert count_correlated_cves("all", db_path=test_db_path) == 10
+    assert count_correlated_cves("nvd_only", db_path=test_db_path) == 5
+    assert count_correlated_cves("cisa_only", db_path=test_db_path) == 3
+    assert count_correlated_cves("both", db_path=test_db_path) == 2
+
+    # Pagination: page 1 (limit=4, offset=0)
+    page1 = get_correlated_cves(filter_status="all", limit=4, offset=0, db_path=test_db_path)
+    assert len(page1) == 4
+
+    # Pagination: page 2 (limit=4, offset=4)
+    page2 = get_correlated_cves(filter_status="all", limit=4, offset=4, db_path=test_db_path)
+    assert len(page2) == 4
+
+    # Pagination: page 3 (limit=4, offset=8)
+    page3 = get_correlated_cves(filter_status="all", limit=4, offset=8, db_path=test_db_path)
+    assert len(page3) == 2
+
+    # Disjoint check across pages
+    ids_p1 = {r["cve_id"] for r in page1}
+    ids_p2 = {r["cve_id"] for r in page2}
+    ids_p3 = {r["cve_id"] for r in page3}
+    assert ids_p1.isdisjoint(ids_p2)
+    assert ids_p2.isdisjoint(ids_p3)
+    assert len(ids_p1 | ids_p2 | ids_p3) == 10
+
+
+def test_correlated_cves_invalid_filter_validation(test_db_path: Path):
+    """Verifies that invalid filter values and out-of-range pagination parameters raise ValueError."""
+    with pytest.raises(ValueError, match="Invalid filter_status 'invalid_status'"):
+        count_correlated_cves("invalid_status", db_path=test_db_path)
+
+    with pytest.raises(ValueError, match="Invalid filter_status 'unknown'"):
+        get_correlated_cves(filter_status="unknown", db_path=test_db_path)
+
+    with pytest.raises(ValueError, match="Parameter 'limit' must be greater than or equal to 1."):
+        get_correlated_cves(filter_status="all", limit=0, offset=0, db_path=test_db_path)
+
+    with pytest.raises(ValueError, match="Parameter 'offset' must be greater than or equal to 0."):
+        get_correlated_cves(filter_status="all", limit=10, offset=-1, db_path=test_db_path)

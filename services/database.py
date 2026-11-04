@@ -427,3 +427,165 @@ def update_bookmark_status(item_id: int, is_bookmarked: bool | int, db_path: Pat
         with conn:
             cursor = conn.execute(query, {"is_bookmarked": status_int, "id": item_id})
             return cursor.rowcount > 0
+
+
+VALID_CORRELATION_STATUSES = ("all", "both", "nvd_only", "cisa_only")
+
+
+def count_correlated_cves(
+    filter_status: str = "all",
+    db_path: Path | str | None = None,
+) -> int:
+    """Returns total count of correlated CVE records matching the given filter status.
+
+    Supported filter_status values: 'all', 'both', 'nvd_only', 'cisa_only'.
+    """
+    if filter_status not in VALID_CORRELATION_STATUSES:
+        raise ValueError(
+            f"Invalid filter_status '{filter_status}'. Must be one of: {', '.join(repr(s) for s in VALID_CORRELATION_STATUSES)}."
+        )
+
+    where_clause = ""
+    params: dict[str, Any] = {}
+    if filter_status != "all":
+        where_clause = "WHERE correlation_status = :status"
+        params["status"] = filter_status
+
+    query = f"""
+    WITH nvd AS (
+        SELECT id, source_id
+        FROM intelligence_items
+        WHERE source = 'NVD CVE'
+    ),
+    cisa AS (
+        SELECT id, source_id
+        FROM intelligence_items
+        WHERE source = 'CISA KEV'
+    ),
+    correlated AS (
+        SELECT
+            CASE
+                WHEN nvd.id IS NOT NULL AND cisa.id IS NOT NULL THEN 'both'
+                WHEN nvd.id IS NOT NULL THEN 'nvd_only'
+                ELSE 'cisa_only'
+            END AS correlation_status
+        FROM nvd
+        FULL OUTER JOIN cisa ON nvd.source_id = cisa.source_id
+    )
+    SELECT COUNT(*) AS total FROM correlated {where_clause};
+    """
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute(query, params)
+        row = cursor.fetchone()
+        return int(row["total"]) if row else 0
+
+
+def get_correlated_cves(
+    filter_status: str = "all",
+    limit: int = 50,
+    offset: int = 0,
+    db_path: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieves correlated CVE records across NVD CVE and CISA KEV sources.
+
+    Correlates records matching on source_id (the CVE identifier) while preserving
+    all individual source fields and user states (is_read, is_bookmarked).
+
+    Supported filter_status values: 'all', 'both', 'nvd_only', 'cisa_only'.
+    """
+    if filter_status not in VALID_CORRELATION_STATUSES:
+        raise ValueError(
+            f"Invalid filter_status '{filter_status}'. Must be one of: {', '.join(repr(s) for s in VALID_CORRELATION_STATUSES)}."
+        )
+    if limit < 1:
+        raise ValueError("Parameter 'limit' must be greater than or equal to 1.")
+    if offset < 0:
+        raise ValueError("Parameter 'offset' must be greater than or equal to 0.")
+
+    where_clause = ""
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if filter_status != "all":
+        where_clause = "WHERE correlation_status = :status"
+        params["status"] = filter_status
+
+    query = f"""
+    WITH nvd AS (
+        SELECT
+            id AS nvd_id,
+            source_id,
+            title AS nvd_title,
+            url AS nvd_url,
+            text AS nvd_text,
+            published_at AS nvd_published_at,
+            is_read AS nvd_is_read,
+            is_bookmarked AS nvd_is_bookmarked
+        FROM intelligence_items
+        WHERE source = 'NVD CVE'
+    ),
+    cisa AS (
+        SELECT
+            id AS cisa_id,
+            source_id,
+            title AS cisa_title,
+            url AS cisa_url,
+            text AS cisa_text,
+            published_at AS cisa_date_added,
+            is_read AS cisa_is_read,
+            is_bookmarked AS cisa_is_bookmarked
+        FROM intelligence_items
+        WHERE source = 'CISA KEV'
+    ),
+    correlated AS (
+        SELECT
+            COALESCE(nvd.source_id, cisa.source_id) AS cve_id,
+            CASE
+                WHEN nvd.nvd_id IS NOT NULL AND cisa.cisa_id IS NOT NULL THEN 'both'
+                WHEN nvd.nvd_id IS NOT NULL THEN 'nvd_only'
+                ELSE 'cisa_only'
+            END AS correlation_status,
+            nvd.nvd_id,
+            nvd.nvd_title,
+            nvd.nvd_url,
+            nvd.nvd_text,
+            nvd.nvd_published_at,
+            nvd.nvd_is_read,
+            nvd.nvd_is_bookmarked,
+            cisa.cisa_id,
+            cisa.cisa_title,
+            cisa.cisa_url,
+            cisa.cisa_text,
+            cisa.cisa_date_added,
+            cisa.cisa_is_read,
+            cisa.cisa_is_bookmarked,
+            MAX(COALESCE(nvd.nvd_published_at, ''), COALESCE(cisa.cisa_date_added, '')) AS latest_date
+        FROM nvd
+        FULL OUTER JOIN cisa ON nvd.source_id = cisa.source_id
+    )
+    SELECT
+        cve_id,
+        correlation_status,
+        nvd_id,
+        nvd_title,
+        nvd_url,
+        nvd_text,
+        nvd_published_at,
+        nvd_is_read,
+        nvd_is_bookmarked,
+        cisa_id,
+        cisa_title,
+        cisa_url,
+        cisa_text,
+        cisa_date_added,
+        cisa_is_read,
+        cisa_is_bookmarked
+    FROM correlated
+    {where_clause}
+    ORDER BY latest_date DESC, cve_id DESC
+    LIMIT :limit OFFSET :offset;
+    """
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute(query, params)
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]

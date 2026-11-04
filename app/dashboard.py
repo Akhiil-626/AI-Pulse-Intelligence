@@ -23,7 +23,9 @@ importlib.reload(services.database)
 
 from services.database import (
     DEFAULT_DB_PATH,
+    count_correlated_cves,
     count_items,
+    get_correlated_cves,
     get_items,
     init_db,
     update_bookmark_status,
@@ -896,6 +898,445 @@ def render_intelligence_feed(db_path: Path | str | None = None) -> None:
                 )
 
 
+STATUS_LABEL_TO_CODE = {
+    "All Statuses": "all",
+    "Present in Both": "both",
+    "NVD Only": "nvd_only",
+    "CISA KEV Only": "cisa_only",
+}
+
+
+def render_threat_center(db_path: Path | str | None = None) -> None:
+    """Renders the correlated Threat Center view matching NVD CVE and CISA KEV records."""
+    target_path = db_path if db_path is not None else get_dashboard_db_path()
+
+    st.markdown('<div class="pulse-title">Threat Center</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="pulse-subtitle">Cross-Source CVE Intelligence & Exploit Correlation (NVD CVE & CISA KEV)</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.info(
+        "🛡️ **Threat Center**: Correlated cybersecurity intelligence matching NVD vulnerability advisories with the CISA Known Exploited Vulnerabilities (KEV) catalog.",
+        icon="🛡️",
+    )
+
+    # 1. Real-time metric cards calculated via database count functions
+    try:
+        init_db(target_path)
+        total_cves = count_correlated_cves("all", db_path=target_path)
+        both_cves = count_correlated_cves("both", db_path=target_path)
+        nvd_only_cves = count_correlated_cves("nvd_only", db_path=target_path)
+        cisa_only_cves = count_correlated_cves("cisa_only", db_path=target_path)
+    except Exception as exc:
+        st.error(f"⚠️ Database error loading Threat Center metrics: {exc}", icon="🚨")
+        total_cves = both_cves = nvd_only_cves = cisa_only_cves = 0
+
+    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+    with mcol1:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Total Distinct CVEs</div>
+                <div class="metric-value">{total_cves}</div>
+                <div class="metric-note">All correlated records</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with mcol2:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">Present in Both</div>
+                <div class="metric-value">{both_cves}</div>
+                <div class="metric-note">Exploited in wild (High risk)</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with mcol3:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">NVD Only</div>
+                <div class="metric-value">{nvd_only_cves}</div>
+                <div class="metric-note">Advisories without KEV entry</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with mcol4:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">CISA KEV Only</div>
+                <div class="metric-value">{cisa_only_cves}</div>
+                <div class="metric-note">KEV without local NVD record</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # 2. Filter control for correlation status
+    filter_col1, _ = st.columns([3, 1])
+    with filter_col1:
+        selected_status_label = st.radio(
+            "Filter by Correlation Status",
+            options=["All Statuses", "Present in Both", "NVD Only", "CISA KEV Only"],
+            index=0,
+            horizontal=True,
+            key="threat_center_status_filter",
+        )
+
+    # Track filter changes and reset pagination
+    if "threat_center_prev_filter" not in st.session_state:
+        st.session_state["threat_center_prev_filter"] = selected_status_label
+    if "threat_center_page" not in st.session_state:
+        st.session_state["threat_center_page"] = 0
+
+    if st.session_state["threat_center_prev_filter"] != selected_status_label:
+        st.session_state["threat_center_page"] = 0
+        st.session_state["threat_center_prev_filter"] = selected_status_label
+
+    # 3. Pagination & record retrieval
+    PAGE_SIZE = 25
+    selected_status_code = STATUS_LABEL_TO_CODE.get(selected_status_label, "all")
+
+    try:
+        filtered_total = count_correlated_cves(selected_status_code, db_path=target_path)
+    except Exception:
+        filtered_total = 0
+
+    total_pages = max(1, (filtered_total + PAGE_SIZE - 1) // PAGE_SIZE)
+    current_page = st.session_state.get("threat_center_page", 0)
+    if current_page >= total_pages:
+        current_page = max(0, total_pages - 1)
+        st.session_state["threat_center_page"] = current_page
+
+    offset = current_page * PAGE_SIZE
+
+    try:
+        records = get_correlated_cves(
+            filter_status=selected_status_code,
+            limit=PAGE_SIZE,
+            offset=offset,
+            db_path=target_path,
+        )
+    except Exception as exc:
+        st.error(f"⚠️ Database error loading correlated records: {exc}", icon="🚨")
+        records = []
+
+    # 4. Empty state when no records match filter
+    if not records:
+        st.markdown(
+            f"""
+            <div class="empty-state-box">
+                <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">🛡️</div>
+                <div class="empty-state-title">No Correlated CVE Records Found</div>
+                <div class="empty-state-text">
+                    No records match the selected correlation status: <strong>{html.escape(selected_status_label)}</strong>.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # 5. Render correlated vulnerability cards
+    for item in records:
+        cve_id = item["cve_id"]
+        status = item["correlation_status"]
+
+        with st.container(border=True):
+            if status == "both":
+                # High-priority alert banner for active exploitation
+                st.markdown(f"### `{cve_id}`")
+                st.markdown(
+                    """
+                    <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: -0.4rem; margin-bottom: 0.85rem; flex-wrap: wrap;">
+                        <span style="background: #991B1B; color: #FEE2E2; font-size: 0.78rem; font-weight: 700; padding: 0.25rem 0.6rem; border-radius: 4px;">
+                            ⚠️ Present in Both (Exploited in Wild)
+                        </span>
+                        <span style="background: #7F1D1D; color: #FCA5A5; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                            Domain: cybersecurity
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                # Comparative 2-column view
+                col_nvd, col_cisa = st.columns(2)
+                with col_nvd:
+                    st.markdown("##### 📋 NVD Vulnerability Advisory")
+                    nvd_pub = item.get("nvd_published_at") or "Unknown"
+                    st.markdown(f"**📅 NVD Published Date:** `{nvd_pub}`")
+                    nvd_url = item.get("nvd_url")
+                    if nvd_url and str(nvd_url).strip():
+                        st.markdown(f"🔗 [View Official NVD Advisory ↗]({str(nvd_url).strip()})")
+
+                    raw_nvd_text = item.get("nvd_text") or item.get("nvd_title")
+                    cleaned_nvd = format_item_text(raw_nvd_text)
+                    if len(cleaned_nvd) > 220:
+                        st.markdown(cleaned_nvd[:220].rstrip() + "...")
+                        with st.expander("Full NVD Description", expanded=False):
+                            st.markdown(cleaned_nvd)
+                    else:
+                        st.markdown(cleaned_nvd)
+
+                    nvd_id = item["nvd_id"]
+                    nvd_bm_key = f"tc_nvd_bm_{nvd_id}"
+                    nvd_rd_key = f"tc_nvd_rd_{nvd_id}"
+                    nvd_is_bm = bool(item.get("nvd_is_bookmarked", 0))
+                    nvd_is_rd = bool(item.get("nvd_is_read", 0))
+
+                    ncol1, ncol2, ncol3 = st.columns([1, 1, 2])
+                    with ncol1:
+                        st.toggle(
+                            "Bookmark",
+                            value=nvd_is_bm,
+                            key=nvd_bm_key,
+                            on_change=handle_bookmark_toggle,
+                            args=(nvd_id, nvd_bm_key, target_path),
+                        )
+                    with ncol2:
+                        st.toggle(
+                            "Read",
+                            value=nvd_is_rd,
+                            key=nvd_rd_key,
+                            on_change=handle_read_toggle,
+                            args=(nvd_id, nvd_rd_key, target_path),
+                        )
+                    with ncol3:
+                        parts = []
+                        if nvd_is_bm:
+                            parts.append("⭐ Bookmarked")
+                        parts.append("✓ Read" if nvd_is_rd else "○ Unread")
+                        st.caption(f"NVD: {' • '.join(parts)}")
+
+                with col_cisa:
+                    st.markdown("##### 🚨 CISA Known Exploited Vulnerability")
+                    cisa_date = item.get("cisa_date_added") or "Unknown"
+                    st.markdown(f"**📅 CISA KEV Date Added:** `{cisa_date}`")
+                    cisa_url = item.get("cisa_url")
+                    if cisa_url and str(cisa_url).strip():
+                        st.markdown(f"🔗 [View Reference on NVD ↗]({str(cisa_url).strip()})")
+
+                    cisa_vuln_name = item.get("cisa_title") or "Known Exploited Vulnerability"
+                    st.markdown(f"**Vulnerability Name:** {cisa_vuln_name}")
+
+                    raw_cisa_text = item.get("cisa_text")
+                    cleaned_cisa = format_item_text(raw_cisa_text)
+                    if len(cleaned_cisa) > 220:
+                        st.markdown(cleaned_cisa[:220].rstrip() + "...")
+                        with st.expander("Full CISA Description", expanded=False):
+                            st.markdown(cleaned_cisa)
+                    else:
+                        st.markdown(cleaned_cisa)
+
+                    cisa_id = item["cisa_id"]
+                    cisa_bm_key = f"tc_cisa_bm_{cisa_id}"
+                    cisa_rd_key = f"tc_cisa_rd_{cisa_id}"
+                    cisa_is_bm = bool(item.get("cisa_is_bookmarked", 0))
+                    cisa_is_rd = bool(item.get("cisa_is_read", 0))
+
+                    ccol1, ccol2, ccol3 = st.columns([1, 1, 2])
+                    with ccol1:
+                        st.toggle(
+                            "Bookmark",
+                            value=cisa_is_bm,
+                            key=cisa_bm_key,
+                            on_change=handle_bookmark_toggle,
+                            args=(cisa_id, cisa_bm_key, target_path),
+                        )
+                    with ccol2:
+                        st.toggle(
+                            "Read",
+                            value=cisa_is_rd,
+                            key=cisa_rd_key,
+                            on_change=handle_read_toggle,
+                            args=(cisa_id, cisa_rd_key, target_path),
+                        )
+                    with ccol3:
+                        parts = []
+                        if cisa_is_bm:
+                            parts.append("⭐ Bookmarked")
+                        parts.append("✓ Read" if cisa_is_rd else "○ Unread")
+                        st.caption(f"CISA: {' • '.join(parts)}")
+
+            elif status == "nvd_only":
+                nvd_url = item.get("nvd_url")
+                nvd_pub = item.get("nvd_published_at") or "Unknown"
+                raw_title = item.get("nvd_title") or "Vulnerability advisory"
+                clean_title = raw_title.replace("[", "\\[").replace("]", "\\]")
+                truncated = clean_title if len(clean_title) <= 140 else clean_title[:137].rstrip() + "..."
+
+                if nvd_url and str(nvd_url).strip():
+                    st.markdown(f"#### [{cve_id}: {truncated}]({str(nvd_url).strip()})")
+                else:
+                    st.markdown(f"#### {cve_id}: {truncated}")
+
+                st.markdown(
+                    f"""
+                    <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.15rem; margin-bottom: 0.65rem; flex-wrap: wrap;">
+                        <span style="background: #831843; color: #FBCFE8; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                            NVD Advisory Only
+                        </span>
+                        <span style="background: #7F1D1D; color: #FCA5A5; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                            Domain: cybersecurity
+                        </span>
+                        <span style="color: #94A3B8; font-size: 0.82rem;">
+                            📅 NVD Published Date: {nvd_pub}
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown(
+                    '<div style="color: #64748B; font-size: 0.82rem; margin-bottom: 0.5rem;">'
+                    'ℹ️ <strong>CISA KEV Status:</strong> Not listed in CISA Known Exploited Vulnerabilities catalog (no confirmed active exploitation reported).'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                cleaned_text = format_item_text(item.get("nvd_text") or item.get("nvd_title"))
+                with st.expander("Full Vulnerability Description", expanded=False):
+                    st.markdown(cleaned_text)
+
+                nvd_id = item["nvd_id"]
+                bm_key = f"tc_nvd_bm_{nvd_id}"
+                rd_key = f"tc_nvd_rd_{nvd_id}"
+                is_bm = bool(item.get("nvd_is_bookmarked", 0))
+                is_rd = bool(item.get("nvd_is_read", 0))
+
+                tcol1, tcol2, tcol3 = st.columns([1, 1, 2])
+                with tcol1:
+                    st.toggle(
+                        "Bookmark",
+                        value=is_bm,
+                        key=bm_key,
+                        on_change=handle_bookmark_toggle,
+                        args=(nvd_id, bm_key, target_path),
+                    )
+                with tcol2:
+                    st.toggle(
+                        "Read",
+                        value=is_rd,
+                        key=rd_key,
+                        on_change=handle_read_toggle,
+                        args=(nvd_id, rd_key, target_path),
+                    )
+                with tcol3:
+                    status_parts = []
+                    if is_bm:
+                        status_parts.append("⭐ Bookmarked")
+                    status_parts.append("✓ Read" if is_rd else "○ Unread")
+                    st.markdown(
+                        f'<div style="color: #94A3B8; font-size: 0.82rem; margin-top: 0.35rem;">{" • ".join(status_parts)}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            else:  # cisa_only
+                cisa_url = item.get("cisa_url")
+                cisa_date = item.get("cisa_date_added") or "Unknown"
+                vuln_name = item.get("cisa_title") or "Known Exploited Vulnerability"
+                clean_vuln = vuln_name.replace("[", "\\[").replace("]", "\\]")
+
+                if cisa_url and str(cisa_url).strip():
+                    st.markdown(f"#### [{cve_id}: {clean_vuln}]({str(cisa_url).strip()})")
+                else:
+                    st.markdown(f"#### {cve_id}: {clean_vuln}")
+
+                st.markdown(
+                    f"""
+                    <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.15rem; margin-bottom: 0.65rem; flex-wrap: wrap;">
+                        <span style="background: #1E1B4B; color: #C7D2FE; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                            CISA KEV Only
+                        </span>
+                        <span style="background: #7F1D1D; color: #FCA5A5; font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.55rem; border-radius: 4px;">
+                            Domain: cybersecurity
+                        </span>
+                        <span style="color: #94A3B8; font-size: 0.82rem;">
+                            📅 CISA KEV Date Added: {cisa_date}
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown(
+                    '<div style="color: #64748B; font-size: 0.82rem; margin-bottom: 0.5rem;">'
+                    'ℹ️ <strong>NVD Record:</strong> Full NVD advisory not present in locally ingested AI Pulse database.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                cleaned_text = format_item_text(item.get("cisa_text") or item.get("cisa_title"))
+                if len(cleaned_text) > 200:
+                    preview_text = cleaned_text[:200].rstrip() + "..."
+                    st.markdown(preview_text)
+                    with st.expander("Full Vulnerability Description", expanded=False):
+                        st.markdown(cleaned_text)
+                else:
+                    st.markdown(cleaned_text)
+
+                cisa_id = item["cisa_id"]
+                bm_key = f"tc_cisa_bm_{cisa_id}"
+                rd_key = f"tc_cisa_rd_{cisa_id}"
+                is_bm = bool(item.get("cisa_is_bookmarked", 0))
+                is_rd = bool(item.get("cisa_is_read", 0))
+
+                tcol1, tcol2, tcol3 = st.columns([1, 1, 2])
+                with tcol1:
+                    st.toggle(
+                        "Bookmark",
+                        value=is_bm,
+                        key=bm_key,
+                        on_change=handle_bookmark_toggle,
+                        args=(cisa_id, bm_key, target_path),
+                    )
+                with tcol2:
+                    st.toggle(
+                        "Read",
+                        value=is_rd,
+                        key=rd_key,
+                        on_change=handle_read_toggle,
+                        args=(cisa_id, rd_key, target_path),
+                    )
+                with tcol3:
+                    status_parts = []
+                    if is_bm:
+                        status_parts.append("⭐ Bookmarked")
+                    status_parts.append("✓ Read" if is_rd else "○ Unread")
+                    st.markdown(
+                        f'<div style="color: #94A3B8; font-size: 0.82rem; margin-top: 0.35rem;">{" • ".join(status_parts)}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+    # 6. Pagination controls
+    st.markdown("---")
+    pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+    with pcol1:
+        if st.button("⬅️ Previous", disabled=(current_page == 0), key="tc_prev_btn"):
+            st.session_state["threat_center_page"] = max(0, current_page - 1)
+            st.rerun()
+    with pcol2:
+        start_idx = offset + 1 if filtered_total > 0 else 0
+        end_idx = min(offset + PAGE_SIZE, filtered_total)
+        st.markdown(
+            f"<div style='text-align: center; color: #94A3B8; font-size: 0.88rem; padding-top: 0.4rem;'>"
+            f"Showing {start_idx}–{end_idx} of {filtered_total} CVEs (Page {current_page + 1} of {total_pages})"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with pcol3:
+        if st.button("Next ➡️", disabled=(current_page >= total_pages - 1), key="tc_next_btn"):
+            st.session_state["threat_center_page"] = current_page + 1
+            st.rerun()
+
+
 def render_placeholder(page_name: str) -> None:
     """Renders clean visual placeholder view for secondary navigation options."""
     st.markdown(f'<div class="pulse-title">{page_name}</div>', unsafe_allow_html=True)
@@ -922,6 +1363,8 @@ def main() -> None:
         render_overview(db_path=target_path)
     elif selected_page == "Intelligence Feed":
         render_intelligence_feed(db_path=target_path)
+    elif selected_page == "Threat Center":
+        render_threat_center(db_path=target_path)
     else:
         render_placeholder(selected_page)
 
