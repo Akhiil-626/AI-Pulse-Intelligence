@@ -7,7 +7,9 @@ transactions, and conflict handling.
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sqlite3
+import sys
 from typing import Any, Generator
 
 DEFAULT_DB_PATH = Path("data") / "ai_pulse.db"
@@ -44,7 +46,7 @@ def get_db_connection(db_path: Path | str | None = None) -> Generator[sqlite3.Co
 
 
 def init_db(db_path: Path | str | None = None) -> None:
-    """Initializes the database schema and creates the intelligence_items table."""
+    """Initializes the database schema and creates the intelligence_items and pipeline_checkpoints tables."""
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS intelligence_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +73,19 @@ def init_db(db_path: Path | str | None = None) -> None:
     CREATE INDEX IF NOT EXISTS idx_intelligence_created_at ON intelligence_items(created_at);
     CREATE INDEX IF NOT EXISTS idx_intelligence_is_read ON intelligence_items(is_read);
     CREATE INDEX IF NOT EXISTS idx_intelligence_is_bookmarked ON intelligence_items(is_bookmarked);
+
+    CREATE TABLE IF NOT EXISTS pipeline_checkpoints (
+        pipeline_id TEXT PRIMARY KEY,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        current_offset INTEGER NOT NULL DEFAULT 0 CHECK (current_offset >= 0),
+        last_page INTEGER NOT NULL DEFAULT 0 CHECK (last_page >= 0),
+        total_records_ingested INTEGER NOT NULL DEFAULT 0 CHECK (total_records_ingested >= 0),
+        status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle', 'in_progress', 'completed', 'failed')),
+        last_error TEXT,
+        last_sync_at TEXT,
+        updated_at TEXT NOT NULL
+    );
     """
     with get_db_connection(db_path) as conn:
         with conn:
@@ -589,3 +604,320 @@ def get_correlated_cves(
         cursor = conn.execute(query, params)
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+
+PIPELINE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+ALLOWED_CHECKPOINT_STATUSES = frozenset({"idle", "in_progress", "completed", "failed"})
+
+
+if "services.database" in sys.modules and hasattr(sys.modules["services.database"], "CheckpointConflictError"):
+    CheckpointConflictError = sys.modules["services.database"].CheckpointConflictError
+else:
+    class CheckpointConflictError(ValueError):
+        """Raised when a checkpoint update conflicts with a concurrent or newer checkpoint state."""
+        pass
+
+
+def validate_checkpoint_dict(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Validates checkpoint dictionary types, values, and constraints."""
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Checkpoint must be a dictionary.")
+
+    pipeline_id = checkpoint.get("pipeline_id")
+    if not pipeline_id or not isinstance(pipeline_id, str) or not pipeline_id.strip():
+        raise ValueError("Field 'pipeline_id' is required and cannot be empty.")
+    pipeline_id_str = pipeline_id.strip()
+    if not PIPELINE_ID_REGEX.match(pipeline_id_str):
+        raise ValueError(
+            f"Invalid pipeline_id '{pipeline_id_str}'. Must be alphanumeric with hyphens or underscores (1-64 characters)."
+        )
+
+    start_date = checkpoint.get("start_date")
+    if not start_date or not isinstance(start_date, str) or not start_date.strip():
+        raise ValueError("Field 'start_date' is required and cannot be empty.")
+    start_date_str = start_date.strip()
+    try:
+        start_dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+    except Exception as e:
+        raise ValueError(f"Field 'start_date' must be a valid ISO-8601 date string: {e}")
+
+    end_date = checkpoint.get("end_date")
+    if not end_date or not isinstance(end_date, str) or not end_date.strip():
+        raise ValueError("Field 'end_date' is required and cannot be empty.")
+    end_date_str = end_date.strip()
+    try:
+        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+    except Exception as e:
+        raise ValueError(f"Field 'end_date' must be a valid ISO-8601 date string: {e}")
+
+    if start_dt > end_dt:
+        raise ValueError("Field 'start_date' must be less than or equal to 'end_date'.")
+
+    def _validate_non_negative_int(val: Any, field_name: str, default: int = 0) -> int:
+        if val is None:
+            return default
+        if not isinstance(val, int) or isinstance(val, bool):
+            raise ValueError(f"Field '{field_name}' must be an integer, got {type(val).__name__}.")
+        if val < 0:
+            raise ValueError(f"Field '{field_name}' must be non-negative (>= 0), got {val}.")
+        return val
+
+    current_offset = _validate_non_negative_int(checkpoint.get("current_offset", 0), "current_offset")
+    last_page = _validate_non_negative_int(checkpoint.get("last_page", 0), "last_page")
+    total_records = _validate_non_negative_int(
+        checkpoint.get("total_records_ingested", 0), "total_records_ingested"
+    )
+
+    status = checkpoint.get("status", "idle")
+    if not status or not isinstance(status, str) or not status.strip():
+        raise ValueError("Field 'status' is required and cannot be empty.")
+    status_str = status.strip()
+    if status_str not in ALLOWED_CHECKPOINT_STATUSES:
+        raise ValueError(
+            f"Field 'status' must be one of {sorted(ALLOWED_CHECKPOINT_STATUSES)}, got '{status_str}'."
+        )
+
+    last_error = checkpoint.get("last_error")
+    last_error_str = str(last_error) if last_error is not None else None
+
+    last_sync_at = checkpoint.get("last_sync_at")
+    last_sync_at_str = None
+    if last_sync_at is not None:
+        last_sync_at_str = str(last_sync_at).strip()
+        if last_sync_at_str:
+            try:
+                datetime.fromisoformat(last_sync_at_str.replace("Z", "+00:00"))
+            except Exception as e:
+                raise ValueError(f"Field 'last_sync_at' must be a valid ISO-8601 date string: {e}")
+        else:
+            last_sync_at_str = None
+
+    updated_at = checkpoint.get("updated_at")
+    if updated_at is not None and isinstance(updated_at, str) and updated_at.strip():
+        updated_at_str = updated_at.strip()
+        try:
+            datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+        except Exception as e:
+            raise ValueError(f"Field 'updated_at' must be a valid ISO-8601 date string: {e}")
+    else:
+        updated_at_str = datetime.now(timezone.utc).isoformat()
+
+    expected_updated_at = checkpoint.get("expected_updated_at")
+    expected_updated_at_str = (
+        str(expected_updated_at).strip() if expected_updated_at is not None else None
+    )
+
+    return {
+        "pipeline_id": pipeline_id_str,
+        "start_date": start_date_str,
+        "end_date": end_date_str,
+        "current_offset": current_offset,
+        "last_page": last_page,
+        "total_records_ingested": total_records,
+        "status": status_str,
+        "last_error": last_error_str,
+        "last_sync_at": last_sync_at_str,
+        "updated_at": updated_at_str,
+        "expected_updated_at": expected_updated_at_str,
+    }
+
+
+def get_pipeline_checkpoint(
+    pipeline_id: str,
+    db_path: Path | str | None = None,
+) -> dict[str, Any] | None:
+    """Retrieves a stored pipeline checkpoint by pipeline_id, or None if uninitialized."""
+    if not pipeline_id or not isinstance(pipeline_id, str) or not pipeline_id.strip():
+        raise ValueError("Parameter 'pipeline_id' is required and cannot be empty.")
+
+    clean_id = pipeline_id.strip()
+    query = """
+    SELECT
+        pipeline_id,
+        start_date,
+        end_date,
+        current_offset,
+        last_page,
+        total_records_ingested,
+        status,
+        last_error,
+        last_sync_at,
+        updated_at
+    FROM pipeline_checkpoints
+    WHERE pipeline_id = ?;
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute(query, (clean_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+
+def save_pipeline_checkpoint(
+    checkpoint: dict[str, Any],
+    db_path: Path | str | None = None,
+) -> bool:
+    """Atomically creates or updates a pipeline checkpoint with concurrency & monotonicity checks.
+
+    Supported status transitions:
+      - idle -> in_progress
+      - idle -> idle
+      - in_progress -> in_progress
+      - in_progress -> completed
+      - in_progress -> failed
+      - failed -> in_progress (explicit resume)
+      - failed -> failed
+
+    Concurrency & stale update protections:
+      - Optimistic concurrency control: if 'expected_updated_at' is provided, rejects update
+        if existing record has been modified by another execution.
+      - Monotonic progress guard: prevents rewinding date window or progress within the same window.
+      - Blocks modification of completed pipelines without explicit reinitialization.
+    """
+    validated = validate_checkpoint_dict(checkpoint)
+    pipeline_id = validated["pipeline_id"]
+    new_status = validated["status"]
+    new_start_date = validated["start_date"]
+    new_end_date = validated["end_date"]
+    new_offset = validated["current_offset"]
+    new_last_page = validated["last_page"]
+    new_total_records = validated["total_records_ingested"]
+    expected_updated_at = validated["expected_updated_at"]
+
+    with get_db_connection(db_path) as conn:
+        with conn:  # Transaction ensures atomic check-and-upsert
+            cursor = conn.execute(
+                """
+                SELECT
+                    pipeline_id,
+                    start_date,
+                    end_date,
+                    current_offset,
+                    last_page,
+                    total_records_ingested,
+                    status,
+                    last_error,
+                    last_sync_at,
+                    updated_at
+                FROM pipeline_checkpoints
+                WHERE pipeline_id = ?;
+                """,
+                (pipeline_id,),
+            )
+            existing_row = cursor.fetchone()
+
+            if existing_row is None:
+                # Initial checkpoint creation
+                # Disallow initializing directly as completed or failed
+                if new_status not in ("idle", "in_progress"):
+                    raise ValueError(
+                        f"Initial checkpoint status must be 'idle' or 'in_progress', got '{new_status}'."
+                    )
+            else:
+                existing = dict(existing_row)
+                existing_status = existing["status"]
+
+                # 1. Optimistic Concurrency Control (OCC) check
+                if expected_updated_at is not None:
+                    if existing["updated_at"] != expected_updated_at:
+                        raise CheckpointConflictError(
+                            f"Concurrency conflict: checkpoint '{pipeline_id}' was modified concurrently "
+                            f"(expected updated_at '{expected_updated_at}', but current is '{existing['updated_at']}')."
+                        )
+
+                # 2. Status transition validation
+                valid_transitions = {
+                    "idle": {"idle", "in_progress"},
+                    "in_progress": {"in_progress", "completed", "failed"},
+                    "failed": {"in_progress", "failed"},
+                    "completed": set(),  # Cannot mutate a completed pipeline
+                }
+                allowed = valid_transitions.get(existing_status, set())
+                if new_status not in allowed:
+                    raise CheckpointConflictError(
+                        f"Invalid status transition from '{existing_status}' to '{new_status}' "
+                        f"for pipeline '{pipeline_id}'."
+                    )
+
+                # 3. Date window monotonicity guard
+                # Ensure start_date does not regress backwards
+                if new_start_date < existing["start_date"]:
+                    raise CheckpointConflictError(
+                        f"Stale checkpoint update: incoming start_date '{new_start_date}' is earlier than "
+                        f"existing start_date '{existing['start_date']}'."
+                    )
+
+                # 4. Global cumulative ingestion count monotonicity guard
+                if new_total_records < existing["total_records_ingested"]:
+                    raise CheckpointConflictError(
+                        f"Stale checkpoint update: incoming total_records_ingested ({new_total_records}) "
+                        f"cannot be less than existing ({existing['total_records_ingested']})."
+                    )
+
+                # 5. Same window progress monotonicity guard
+                if new_start_date == existing["start_date"]:
+                    if new_status in ("in_progress", "completed"):
+                        if new_last_page < existing["last_page"]:
+                            raise CheckpointConflictError(
+                                f"Stale checkpoint update: incoming last_page ({new_last_page}) "
+                                f"is less than existing ({existing['last_page']})."
+                            )
+                        if new_offset < existing["current_offset"]:
+                            raise CheckpointConflictError(
+                                f"Stale checkpoint update: incoming current_offset ({new_offset}) "
+                                f"is less than existing ({existing['current_offset']})."
+                            )
+
+            # Atomic Upsert Statement
+            upsert_sql = """
+            INSERT INTO pipeline_checkpoints (
+                pipeline_id,
+                start_date,
+                end_date,
+                current_offset,
+                last_page,
+                total_records_ingested,
+                status,
+                last_error,
+                last_sync_at,
+                updated_at
+            ) VALUES (
+                :pipeline_id,
+                :start_date,
+                :end_date,
+                :current_offset,
+                :last_page,
+                :total_records_ingested,
+                :status,
+                :last_error,
+                :last_sync_at,
+                :updated_at
+            )
+            ON CONFLICT(pipeline_id) DO UPDATE SET
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                current_offset = excluded.current_offset,
+                last_page = excluded.last_page,
+                total_records_ingested = excluded.total_records_ingested,
+                status = excluded.status,
+                last_error = excluded.last_error,
+                last_sync_at = excluded.last_sync_at,
+                updated_at = excluded.updated_at;
+            """
+            conn.execute(
+                upsert_sql,
+                {
+                    "pipeline_id": validated["pipeline_id"],
+                    "start_date": validated["start_date"],
+                    "end_date": validated["end_date"],
+                    "current_offset": validated["current_offset"],
+                    "last_page": validated["last_page"],
+                    "total_records_ingested": validated["total_records_ingested"],
+                    "status": validated["status"],
+                    "last_error": validated["last_error"],
+                    "last_sync_at": validated["last_sync_at"],
+                    "updated_at": validated["updated_at"],
+                },
+            )
+    return True

@@ -22,6 +22,9 @@ from services.database import (
     get_connection,
     count_correlated_cves,
     get_correlated_cves,
+    get_pipeline_checkpoint,
+    save_pipeline_checkpoint,
+    CheckpointConflictError,
 )
 
 
@@ -929,3 +932,531 @@ def test_correlated_cves_invalid_filter_validation(test_db_path: Path):
 
     with pytest.raises(ValueError, match="Parameter 'offset' must be greater than or equal to 0."):
         get_correlated_cves(filter_status="all", limit=10, offset=-1, db_path=test_db_path)
+
+
+# ============================================================================
+# Pipeline Checkpoints Tests
+# ============================================================================
+
+
+def test_init_db_creates_pipeline_checkpoints_table_and_is_idempotent(test_db_path: Path):
+    """Verifies that init_db creates pipeline_checkpoints table idempotently."""
+    conn = get_connection(test_db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='pipeline_checkpoints';"
+        )
+        assert cursor.fetchone() is not None
+
+        cursor.execute("PRAGMA table_info(pipeline_checkpoints);")
+        columns = {row["name"]: row["type"] for row in cursor.fetchall()}
+        expected_cols = {
+            "pipeline_id",
+            "start_date",
+            "end_date",
+            "current_offset",
+            "last_page",
+            "total_records_ingested",
+            "status",
+            "last_error",
+            "last_sync_at",
+            "updated_at",
+        }
+        assert expected_cols.issubset(set(columns.keys()))
+    finally:
+        conn.close()
+
+    # Re-running init_db must be completely idempotent
+    init_db(test_db_path)
+    init_db(test_db_path)
+
+
+def test_get_uninitialized_checkpoint_returns_none(test_db_path: Path):
+    """Verifies that querying a non-existent pipeline checkpoint returns None."""
+    result = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert result is None
+
+    # Invalid empty pipeline_id must raise ValueError
+    with pytest.raises(ValueError, match="pipeline_id"):
+        get_pipeline_checkpoint("", db_path=test_db_path)
+    with pytest.raises(ValueError, match="pipeline_id"):
+        get_pipeline_checkpoint("   ", db_path=test_db_path)
+
+
+def test_initial_checkpoint_creation_idle_and_in_progress(test_db_path: Path):
+    """Verifies creating initial checkpoints with idle and in_progress status."""
+    cp_idle = {
+        "pipeline_id": "nvd_backfill",
+        "start_date": "2002-01-01T00:00:00Z",
+        "end_date": "2002-04-01T00:00:00Z",
+        "current_offset": 0,
+        "last_page": 0,
+        "total_records_ingested": 0,
+        "status": "idle",
+        "last_sync_at": None,
+    }
+    assert save_pipeline_checkpoint(cp_idle, db_path=test_db_path) is True
+
+    stored = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert stored is not None
+    assert stored["pipeline_id"] == "nvd_backfill"
+    assert stored["status"] == "idle"
+    assert stored["current_offset"] == 0
+    assert stored["last_page"] == 0
+    assert stored["total_records_ingested"] == 0
+    assert stored["last_sync_at"] is None
+    assert stored["last_error"] is None
+
+    # Disallow initial creation directly as 'completed' or 'failed'
+    with pytest.raises(ValueError, match="Initial checkpoint status must be 'idle' or 'in_progress'"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "other_pipeline",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "status": "completed",
+            },
+            db_path=test_db_path,
+        )
+
+
+def test_update_checkpoint_and_supported_transitions(test_db_path: Path):
+    """Verifies all valid state transitions: idle -> in_progress -> in_progress -> failed -> in_progress -> completed."""
+    # 1. Start idle
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 0,
+            "last_page": 0,
+            "total_records_ingested": 0,
+            "status": "idle",
+        },
+        db_path=test_db_path,
+    )
+
+    # 2. Transition idle -> in_progress
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 2000,
+            "last_page": 1,
+            "total_records_ingested": 2000,
+            "status": "in_progress",
+            "last_sync_at": "2026-11-05T12:00:00Z",
+        },
+        db_path=test_db_path,
+    )
+    rec = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert rec["status"] == "in_progress"
+    assert rec["current_offset"] == 2000
+    assert rec["last_page"] == 1
+    assert rec["total_records_ingested"] == 2000
+
+    # 3. Transition in_progress -> in_progress (advance page)
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 4000,
+            "last_page": 2,
+            "total_records_ingested": 4000,
+            "status": "in_progress",
+            "last_sync_at": "2026-11-05T12:05:00Z",
+        },
+        db_path=test_db_path,
+    )
+    rec = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert rec["current_offset"] == 4000
+    assert rec["last_page"] == 2
+
+    # 4. Transition in_progress -> failed
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 4000,
+            "last_page": 2,
+            "total_records_ingested": 4000,
+            "status": "failed",
+            "last_error": "NVD API HTTP 503 Service Unavailable",
+            "last_sync_at": "2026-11-05T12:05:00Z",
+        },
+        db_path=test_db_path,
+    )
+    rec = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert rec["status"] == "failed"
+    assert rec["last_error"] == "NVD API HTTP 503 Service Unavailable"
+
+    # 5. Transition failed -> in_progress (explicit resume)
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 6000,
+            "last_page": 3,
+            "total_records_ingested": 5500,
+            "status": "in_progress",
+            "last_error": None,
+            "last_sync_at": "2026-11-05T12:15:00Z",
+        },
+        db_path=test_db_path,
+    )
+    rec = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert rec["status"] == "in_progress"
+    assert rec["last_page"] == 3
+    assert rec["total_records_ingested"] == 5500
+
+    # 6. Transition in_progress -> completed
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 6000,
+            "last_page": 3,
+            "total_records_ingested": 5500,
+            "status": "completed",
+            "last_sync_at": "2026-11-05T12:20:00Z",
+        },
+        db_path=test_db_path,
+    )
+    rec = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert rec["status"] == "completed"
+
+
+def test_invalid_status_transitions_rejected(test_db_path: Path):
+    """Verifies that invalid status transitions raise CheckpointConflictError."""
+    # idle -> completed is invalid
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "status": "idle",
+        },
+        db_path=test_db_path,
+    )
+    with pytest.raises(CheckpointConflictError, match="Invalid status transition from 'idle' to 'completed'"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "status": "completed",
+            },
+            db_path=test_db_path,
+        )
+
+    # idle -> failed is invalid
+    with pytest.raises(CheckpointConflictError, match="Invalid status transition from 'idle' to 'failed'"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "status": "failed",
+            },
+            db_path=test_db_path,
+        )
+
+
+def test_completed_pipeline_cannot_be_overwritten(test_db_path: Path):
+    """Verifies that a completed pipeline checkpoint cannot be mutated."""
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "status": "in_progress",
+        },
+        db_path=test_db_path,
+    )
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "status": "completed",
+        },
+        db_path=test_db_path,
+    )
+
+    with pytest.raises(CheckpointConflictError, match="Invalid status transition from 'completed'"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "status": "in_progress",
+            },
+            db_path=test_db_path,
+        )
+
+
+def test_invalid_status_value_rejected(test_db_path: Path):
+    """Verifies that invalid status names raise ValueError."""
+    for invalid_status in ["running", "paused", "done", "active", ""]:
+        with pytest.raises(ValueError, match="Field 'status'"):
+            save_pipeline_checkpoint(
+                {
+                    "pipeline_id": "nvd_backfill",
+                    "start_date": "2002-01-01T00:00:00Z",
+                    "end_date": "2002-04-01T00:00:00Z",
+                    "status": invalid_status,
+                },
+                db_path=test_db_path,
+            )
+
+
+def test_negative_numeric_fields_rejected(test_db_path: Path):
+    """Verifies that negative offsets, page numbers, or record counts raise ValueError."""
+    base = {
+        "pipeline_id": "nvd_backfill",
+        "start_date": "2002-01-01T00:00:00Z",
+        "end_date": "2002-04-01T00:00:00Z",
+        "status": "in_progress",
+    }
+
+    with pytest.raises(ValueError, match="current_offset"):
+        save_pipeline_checkpoint({**base, "current_offset": -1}, db_path=test_db_path)
+
+    with pytest.raises(ValueError, match="last_page"):
+        save_pipeline_checkpoint({**base, "last_page": -5}, db_path=test_db_path)
+
+    with pytest.raises(ValueError, match="total_records_ingested"):
+        save_pipeline_checkpoint({**base, "total_records_ingested": -10}, db_path=test_db_path)
+
+
+def test_invalid_date_fields_rejected(test_db_path: Path):
+    """Verifies that invalid or inverted date formats raise ValueError."""
+    base = {
+        "pipeline_id": "nvd_backfill",
+        "current_offset": 0,
+        "last_page": 0,
+        "status": "in_progress",
+    }
+
+    with pytest.raises(ValueError, match="start_date"):
+        save_pipeline_checkpoint({**base, "start_date": "not-a-date", "end_date": "2002-04-01T00:00:00Z"}, db_path=test_db_path)
+
+    with pytest.raises(ValueError, match="end_date"):
+        save_pipeline_checkpoint({**base, "start_date": "2002-01-01T00:00:00Z", "end_date": "malformed"}, db_path=test_db_path)
+
+    # Inverted date window: start_date > end_date
+    with pytest.raises(ValueError, match="start_date' must be less than or equal to 'end_date'"):
+        save_pipeline_checkpoint(
+            {**base, "start_date": "2002-04-01T00:00:00Z", "end_date": "2002-01-01T00:00:00Z"},
+            db_path=test_db_path,
+        )
+
+    with pytest.raises(ValueError, match="last_sync_at"):
+        save_pipeline_checkpoint(
+            {
+                **base,
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "last_sync_at": "invalid_sync_timestamp",
+            },
+            db_path=test_db_path,
+        )
+
+
+def test_stale_update_regression_rejected(test_db_path: Path):
+    """Verifies that stale updates attempting to rewind pages, offsets, or windows are rejected."""
+    # Establish progress at page 2, offset 4000, 3800 records
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 4000,
+            "last_page": 2,
+            "total_records_ingested": 3800,
+            "status": "in_progress",
+        },
+        db_path=test_db_path,
+    )
+
+    # 1. Stale update trying to rewind last_page to 1
+    with pytest.raises(CheckpointConflictError, match="Stale checkpoint update: incoming last_page"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "current_offset": 4000,
+                "last_page": 1,
+                "total_records_ingested": 3800,
+                "status": "in_progress",
+            },
+            db_path=test_db_path,
+        )
+
+    # 2. Stale update trying to rewind current_offset to 2000
+    with pytest.raises(CheckpointConflictError, match="Stale checkpoint update: incoming current_offset"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "current_offset": 2000,
+                "last_page": 2,
+                "total_records_ingested": 3800,
+                "status": "in_progress",
+            },
+            db_path=test_db_path,
+        )
+
+    # 3. Stale update trying to rewind total_records_ingested to 2000
+    with pytest.raises(CheckpointConflictError, match="Stale checkpoint update: incoming total_records_ingested"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "current_offset": 4000,
+                "last_page": 2,
+                "total_records_ingested": 2000,
+                "status": "in_progress",
+            },
+            db_path=test_db_path,
+        )
+
+    # 4. Stale update trying to rewind start_date backwards
+    with pytest.raises(CheckpointConflictError, match="Stale checkpoint update: incoming start_date"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2001-10-01T00:00:00Z",
+                "end_date": "2002-01-01T00:00:00Z",
+                "current_offset": 0,
+                "last_page": 0,
+                "total_records_ingested": 3800,
+                "status": "in_progress",
+            },
+            db_path=test_db_path,
+        )
+
+
+def test_optimistic_concurrency_control_conflict(test_db_path: Path):
+    """Verifies that OCC rejects an update when expected_updated_at does not match."""
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 0,
+            "last_page": 0,
+            "status": "in_progress",
+            "updated_at": "2026-11-05T10:00:00Z",
+        },
+        db_path=test_db_path,
+    )
+
+    # Worker A updates checkpoint to 10:05
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 2000,
+            "last_page": 1,
+            "total_records_ingested": 2000,
+            "status": "in_progress",
+            "updated_at": "2026-11-05T10:05:00Z",
+            "expected_updated_at": "2026-11-05T10:00:00Z",
+        },
+        db_path=test_db_path,
+    )
+
+    # Worker B had read at 10:00 and tries to commit with expected_updated_at='2026-11-05T10:00:00Z'
+    with pytest.raises(CheckpointConflictError, match="Concurrency conflict"):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "current_offset": 2000,
+                "last_page": 1,
+                "total_records_ingested": 2000,
+                "status": "in_progress",
+                "updated_at": "2026-11-05T10:06:00Z",
+                "expected_updated_at": "2026-11-05T10:00:00Z",
+            },
+            db_path=test_db_path,
+        )
+
+
+def test_window_advancement_allows_offset_reset(test_db_path: Path):
+    """Verifies that advancing to a newer 90-day window safely resets offset and page to 0."""
+    # Window 1
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-01-01T00:00:00Z",
+            "end_date": "2002-04-01T00:00:00Z",
+            "current_offset": 4000,
+            "last_page": 2,
+            "total_records_ingested": 3500,
+            "status": "in_progress",
+        },
+        db_path=test_db_path,
+    )
+
+    # Advance to Window 2: offsets reset to 0, total_records continues from 3500
+    save_pipeline_checkpoint(
+        {
+            "pipeline_id": "nvd_backfill",
+            "start_date": "2002-04-01T00:00:00Z",
+            "end_date": "2002-07-01T00:00:00Z",
+            "current_offset": 0,
+            "last_page": 0,
+            "total_records_ingested": 3500,
+            "status": "in_progress",
+        },
+        db_path=test_db_path,
+    )
+
+    stored = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert stored["start_date"] == "2002-04-01T00:00:00Z"
+    assert stored["end_date"] == "2002-07-01T00:00:00Z"
+    assert stored["current_offset"] == 0
+    assert stored["last_page"] == 0
+    assert stored["total_records_ingested"] == 3500
+
+
+def test_atomic_checkpoint_upsert_behavior(test_db_path: Path):
+    """Verifies that multiple valid updates atomically modify the single pipeline record."""
+    for i in range(1, 6):
+        save_pipeline_checkpoint(
+            {
+                "pipeline_id": "nvd_backfill",
+                "start_date": "2002-01-01T00:00:00Z",
+                "end_date": "2002-04-01T00:00:00Z",
+                "current_offset": i * 2000,
+                "last_page": i,
+                "total_records_ingested": i * 1900,
+                "status": "in_progress",
+            },
+            db_path=test_db_path,
+        )
+
+    conn = get_connection(test_db_path)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM pipeline_checkpoints").fetchone()[0]
+        assert count == 1
+    finally:
+        conn.close()
+
+    final = get_pipeline_checkpoint("nvd_backfill", db_path=test_db_path)
+    assert final["last_page"] == 5
+    assert final["current_offset"] == 10000
+    assert final["total_records_ingested"] == 9500

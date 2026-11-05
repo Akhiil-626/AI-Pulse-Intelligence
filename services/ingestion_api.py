@@ -8,15 +8,24 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 import secrets
 from typing import Any, AsyncGenerator, Literal, Union
 
 from dotenv import load_dotenv
 from fastapi import Body, Depends, FastAPI, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from services.database import DEFAULT_DB_PATH, init_db, insert_items, upsert_items
+from services.database import (
+    DEFAULT_DB_PATH,
+    CheckpointConflictError,
+    get_pipeline_checkpoint,
+    init_db,
+    insert_items,
+    save_pipeline_checkpoint,
+    upsert_items,
+)
 
 # Load environment variables from .env file if present
 load_dotenv()
@@ -78,6 +87,120 @@ class IngestResponse(BaseModel):
     updated: int = Field(default=0, description="Count of existing items updated with new metadata")
     skipped: int = Field(default=0, description="Count of duplicate items skipped")
     message: str | None = Field(default=None, description="Optional status message")
+
+
+PIPELINE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def validate_pipeline_id(pipeline_id: str) -> str:
+    """Validates that pipeline_id adheres to safe alphanumeric/hyphen/underscore naming."""
+    clean_id = pipeline_id.strip() if isinstance(pipeline_id, str) else ""
+    if not clean_id or not PIPELINE_ID_PATTERN.match(clean_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid pipeline identifier '{pipeline_id}'. "
+                "Must be alphanumeric with hyphens or underscores (1-64 characters)."
+            ),
+        )
+    return clean_id
+
+
+class CheckpointPayload(BaseModel):
+    """Pydantic model for setting or updating a pipeline checkpoint."""
+
+    start_date: str = Field(..., description="Start date of the current window (ISO-8601)")
+    end_date: str = Field(..., description="End date of the current window (ISO-8601)")
+    current_offset: int = Field(0, ge=0, description="Next pagination offset (NVD startIndex)")
+    last_page: int = Field(0, ge=0, description="Last successfully committed page index")
+    total_records_ingested: int = Field(0, ge=0, description="Cumulative records ingested")
+    status: Literal["idle", "in_progress", "completed", "failed"] = Field(
+        "idle", description="Current pipeline execution status"
+    )
+    last_error: str | None = Field(default=None, description="Error message if status is failed")
+    last_sync_at: str | None = Field(default=None, description="Timestamp of last successful commit")
+    updated_at: str | None = Field(default=None, description="ISO-8601 timestamp of this update")
+    expected_updated_at: str | None = Field(
+        default=None,
+        description="Optional concurrency token for optimistic concurrency control",
+    )
+
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def validate_iso_dates(cls, value: Any, info) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Field '{info.field_name}' must be a non-empty ISO-8601 date string.")
+        cleaned = value.strip()
+        try:
+            datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        except Exception as e:
+            raise ValueError(f"Field '{info.field_name}' must be a valid ISO-8601 date string: {e}")
+        return cleaned
+
+    @field_validator("last_sync_at", "updated_at", "expected_updated_at", mode="before")
+    @classmethod
+    def validate_optional_iso_dates(cls, value: Any, info) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            return None
+        cleaned = value.strip()
+        try:
+            datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+        except Exception as e:
+            raise ValueError(f"Field '{info.field_name}' must be a valid ISO-8601 date string: {e}")
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_date_window(self) -> "CheckpointPayload":
+        start = datetime.fromisoformat(self.start_date.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(self.end_date.replace("Z", "+00:00"))
+        if start > end:
+            raise ValueError("Field 'start_date' must be less than or equal to 'end_date'.")
+        return self
+
+
+class CheckpointData(BaseModel):
+    """Schema representing structured checkpoint data."""
+
+    pipeline_id: str
+    start_date: str
+    end_date: str
+    current_offset: int
+    last_page: int
+    total_records_ingested: int
+    status: Literal["idle", "in_progress", "completed", "failed"]
+    last_error: str | None = None
+    last_sync_at: str | None = None
+    updated_at: str
+
+
+class CheckpointResponse(BaseModel):
+    """Response returned when querying a pipeline checkpoint."""
+
+    pipeline_id: str
+    initialized: bool
+    status: Literal["idle", "in_progress", "completed", "failed"] | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    current_offset: int | None = None
+    last_page: int | None = None
+    total_records_ingested: int | None = None
+    last_error: str | None = None
+    last_sync_at: str | None = None
+    updated_at: str | None = None
+    checkpoint: CheckpointData | None = None
+    message: str
+
+
+class CheckpointSaveResponse(BaseModel):
+    """Response returned upon saving a pipeline checkpoint."""
+
+    pipeline_id: str
+    saved: bool
+    status: Literal["idle", "in_progress", "completed", "failed"]
+    checkpoint: CheckpointData
+    message: str
 
 
 # Authentication Security Scheme
@@ -221,4 +344,97 @@ def ingest_records(
         inserted=inserted_count,
         updated=updated_count,
         skipped=skipped_count,
+    )
+
+
+@app.get(
+    "/api/v1/checkpoint/{pipeline_id}",
+    response_model=CheckpointResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Retrieve pipeline checkpoint",
+    description="Retrieves the current execution checkpoint for a pipeline. Returns uninitialized response if not found.",
+)
+def get_checkpoint_endpoint(
+    pipeline_id: str,
+    db_path: Path = Depends(get_active_db_path),
+    authenticated: bool = Depends(verify_bearer_token),
+) -> CheckpointResponse:
+    """Retrieves stored checkpoint for pipeline_id or returns a clear uninitialized response."""
+    clean_id = validate_pipeline_id(pipeline_id)
+    init_db(db_path)
+
+    record = get_pipeline_checkpoint(clean_id, db_path=db_path)
+    if record is None:
+        return CheckpointResponse(
+            pipeline_id=clean_id,
+            initialized=False,
+            message=f"Pipeline checkpoint '{clean_id}' has not been initialized.",
+        )
+
+    data = CheckpointData(**record)
+    return CheckpointResponse(
+        pipeline_id=clean_id,
+        initialized=True,
+        status=data.status,
+        start_date=data.start_date,
+        end_date=data.end_date,
+        current_offset=data.current_offset,
+        last_page=data.last_page,
+        total_records_ingested=data.total_records_ingested,
+        last_error=data.last_error,
+        last_sync_at=data.last_sync_at,
+        updated_at=data.updated_at,
+        checkpoint=data,
+        message="Checkpoint retrieved successfully.",
+    )
+
+
+@app.post(
+    "/api/v1/checkpoint/{pipeline_id}",
+    response_model=CheckpointSaveResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Save or advance pipeline checkpoint",
+    description="Atomically upserts a pipeline checkpoint with optimistic concurrency and monotonicity validation.",
+)
+def set_pipeline_checkpoint(
+    pipeline_id: str,
+    payload: CheckpointPayload = Body(...),
+    db_path: Path = Depends(get_active_db_path),
+    authenticated: bool = Depends(verify_bearer_token),
+) -> CheckpointSaveResponse:
+    """Saves or advances a pipeline checkpoint atomically."""
+    clean_id = validate_pipeline_id(pipeline_id)
+    init_db(db_path)
+
+    checkpoint_dict = payload.model_dump()
+    checkpoint_dict["pipeline_id"] = clean_id
+
+    try:
+        save_pipeline_checkpoint(checkpoint_dict, db_path=db_path)
+    except Exception as err:
+        if type(err).__name__ == "CheckpointConflictError" or isinstance(err, CheckpointConflictError):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(err),
+            )
+        if isinstance(err, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(err),
+            )
+        raise
+
+    updated_record = get_pipeline_checkpoint(clean_id, db_path=db_path)
+    if not updated_record:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Checkpoint saved but could not be re-read from database.",
+        )
+
+    return CheckpointSaveResponse(
+        pipeline_id=clean_id,
+        saved=True,
+        status=updated_record["status"],
+        checkpoint=CheckpointData(**updated_record),
+        message="Checkpoint saved successfully.",
     )
